@@ -411,7 +411,7 @@ You can browse all of these *from babelTUI itself*. That feels right, doesn't it
 This whole thing was coded, documented and testing was done on my Samsung Galaxy S21 Ultra using:
 - [Pyramide](https://play.google.com/store/apps/details?id=iiec.pyramide.python) and [QuickEdit+](https://play.google.com/store/apps/details?id=com.rhmsoft.edit.pro)
 
-- babel works on [Pyramide](https://play.google.com/store/apps/details?id=iiec.pyramide.python), [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3), [QPython](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [QPython+](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [Termux](https://play.google.com/store/apps/details?id=com.termux)
+- babel works on [PyramIDE](https://play.google.com/store/apps/details?id=iiec.pyramide.python), [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3), [QPython](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [QPython+](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [Termux](https://play.google.com/store/apps/details?id=com.termux)
 
 
 
