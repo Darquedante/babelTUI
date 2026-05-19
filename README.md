@@ -49,7 +49,7 @@ No npm. No virtualenv. No Electron. No 400MB of `node_modules`. Just `python bab
 Because the existing browser landscape looks like this:
 
 - **The Big Web™** — 200 trackers, six cookie banners, and a popup begging you to install an app, all to read 400 words.
-- **One-protocol smolnet clients** — great, but now you've got `amfora` for Gemini, `lagrange` for Gemini-but-prettier, `bombadillo` for Gopher, a separate finger client, *and kepler this is the first project outside the protocol author's [![Caztor](https://github.com/kevinboone/caztor)] browser*
+- **Smolnet clients** — great, but now you've got `amfora` for Gemini, `lagrange` for Gemini-but-prettier, `bombadillo` for Gopher, a separate finger client, *and kepler this is the first project outside the protocol author's [[Caztor](https://github.com/kevinboone/caztor)] browser*
 - **babelTUI** — speaks `kepler://`, `keplers://`, `gemini://`, `spartan://`, `nex://`, `gopher://`, and `finger://` from one prompt. Click a Gopher menu item that points to a Gemini capsule and it just *works*.
 
 ### The pitch in five bullets
