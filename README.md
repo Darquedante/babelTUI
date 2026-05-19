@@ -2,8 +2,8 @@
 
 ```
 ╔══════════════════════════════════════════════════════╗
-║    ██████╗  █████╗ ██████╗ ███████╗██╗      kepler   ║
-║    ██╔══██╗██╔══██╗██╔══██╗██╔════╝██║      keplers  ║
+║    ██████╗  █████╗ ██████╗ ███████╗██╗      kepler       ║
+║    ██╔══██╗██╔══██╗██╔══██╗██╔════╝██║      keplers.    ║
 ║    ██████╔╝███████║██████╔╝█████╗  ██║      gemini   ║
 ║    ██╔══██╗██╔══██║██╔══██╗██╔══╝  ██║      gopher   ║
 ║    ██████╔╝██║  ██║██████╔╝███████╗███████╗  nex     ║
@@ -13,16 +13,23 @@
 ╚══════════════════════════════════════════════════════╝
 ```
 
+
 ### *One terminal. Seven protocols. Zero dependencies. No JavaScript. No ads. No tracking. No corporate dashboards screaming for your attention.*
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Pure stdlib](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](https://docs.python.org/3/library/)
 [![Single file](https://img.shields.io/badge/distribution-one_file-orange.svg)](#-installation)
 [![Protocols](https://img.shields.io/badge/protocols-7-purple.svg)](#-supported-protocols)
+[![Finger](https://img.shields.io/badge/finger-RFC_1288-8a2be2.svg)](https://datatracker.ietf.org/doc/html/rfc1288)
+[![Gemini](https://img.shields.io/badge/gemini-protocol-00bfa5.svg)](https://geminiprotocol.net/)
+[![Gopher](https://img.shields.io/badge/gopher-RFC_1436-ffb300.svg)](https://datatracker.ietf.org/doc/html/rfc1436)
 [![Kepler 0.1c](https://img.shields.io/badge/kepler-0.1c-9cf.svg)](https://github.com/kevinboone/kepler-protocol)
+[![Nex](https://img.shields.io/badge/nex-protocol-e91e63.svg)](https://nightfall.city/nex/info/specification.txt)
+[![Spartan](https://img.shields.io/badge/spartan-protocol-c0392b.svg)](https://spartan.mozz.us/)
 [![Smolnet](https://img.shields.io/badge/smolnet-approved-ff69b4.svg)](#)
 [![License](https://img.shields.io/badge/license-see_LICENSE-lightgrey.svg)](LICENSE)
 
+---
 ---
 
 ## 💫 What is this?
