@@ -402,9 +402,18 @@ Include:
 - `keplers://larsthebear.me/` — the reference Kepler server
 - `gemini://geminiprotocol.net/` — the Gemini mothership
 - `spartan://mozz.us/` — default home, lovely board
-- `gopher://gopher.floodgap.com/` — the ur-Gopher
+- `gopher://gopher.floodgap.com/` — the OG -Gopher
 
 You can browse all of these *from babelTUI itself*. That feels right, doesn't it.
+
+### Android
+
+This whole thing was coded, documented and testing was done on my Samsung Galaxy S21 Ultra using:
+- [Pyramide](https://play.google.com/store/apps/details?id=iiec.pyramide.python) and [QuickEdit+](https://play.google.com/store/apps/details?id=com.rhmsoft.edit.pro)
+
+- babel works on [Pyramide](https://play.google.com/store/apps/details?id=iiec.pyramide.python), [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3), [QPython](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [QPython+](https://play.google.com/store/apps/details?id=org.qpython.qpy3), [Termux](https://play.google.com/store/apps/details?id=com.termux)
+
+
 
 ### Related software
 
