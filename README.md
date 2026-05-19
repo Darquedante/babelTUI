@@ -54,7 +54,7 @@ Because the existing browser landscape looks like this:
 
 ### The pitch in five bullets
 
-- 🪶 **Featherweight** — single Python file, no dependencies, runs anywhere Python 3.10 does
+- 🪶 **Featherweight** — single Python file, no dependencies, runs anywhere Python 3.10 does *I successfully run it on  my sdf.org account and they run Python 3.9.19!*
 - 🔐 **TOFU pinning** — Trust-On-First-Use certificate verification, the way smolnet does TLS
 - 🎨 **Pretty gemtext** — semantic ANSI colour, proper headings, bullet lists, framed code blocks
 - 🧭 **Real navigation** — back/forward history, bookmarks, in-page search, link-by-number
