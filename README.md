@@ -101,7 +101,7 @@ Point babelTUI at either and you're talking Kepler. The bones of a scalable smol
 There's no installer. There's no package. There's a Python file. That's the install.
 
 ```bash
-git clone https://github.com/<your-user>/babelTUI.git
+git clone https://github.com/darquedante/babelTUI.git
 cd babelTUI
 chmod +x babeltui.py
 ./babeltui.py
