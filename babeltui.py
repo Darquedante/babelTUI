@@ -16,7 +16,6 @@ import json
 import mimetypes
 import os
 import re
-import readline
 import shutil
 import socket
 import ssl
@@ -34,6 +33,14 @@ from urllib.parse import (
     urlparse,
     urlunparse,
 )
+
+# readline is optional: absent on Windows without pyreadline3, or in stripped
+# builds. The REPL still works without it (no line-editing / tab-completion),
+# and getch() already has its own Windows path.
+try:
+    import readline
+except ImportError:  # pragma: no cover - platform dependent
+    readline = None
 
 # ── URL Scheme Registration ─────────────────────────────────────────────────
 #
@@ -97,15 +104,28 @@ _CONFIG_FILE      = _CONFIG_DIR / "config.json"
 # ── Atomic JSON I/O ─────────────────────────────────────────────────────────
 
 def _atomic_write_json(path: Path, data, *, mode: int = 0o600) -> None:
-    """Write JSON atomically (write to .tmp, then replace)."""
+    """Write JSON atomically (write to .tmp, then replace).
+
+    On any failure, the temporary file is removed so we never leave a
+    half-written ``*.tmp`` artefact behind.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
-        os.chmod(tmp, mode)
+        tmp.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        tmp.replace(path)
     except OSError:
-        pass
-    tmp.replace(path)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _read_json(path: Path):
@@ -407,6 +427,10 @@ def _tofu_check(
     if expected_fp is None:
         if accept_new_host:
             known_hosts[host] = actual_fp
+            # First contact: surface the pinned fingerprint so the user can
+            # verify it out-of-band if they wish (classic TOFU disclosure).
+            print(dim(f"\n  🔑  Pinned new certificate for {host}"))
+            print(dim(f"      SHA-256: {actual_fp}"))
             return True
         raise ssl.SSLError(f"Unknown host {host} and accept_new_host=False")
 
@@ -490,6 +514,11 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
     success line such as ``20 text/gemini`` is handled correctly, and
     ``20 1024 text/gemini`` will set content_length=1024 with the other
     fields left at their -1 defaults.
+
+    Note the all-numeric edge case: a line like ``20 12345`` (no mimetype
+    token) is interpreted as content_length=12345 with mimetype defaulting
+    to text/gemini; _read_n_bytes() degrades gracefully to EOF if the
+    server doesn't actually send that many bytes.
     """
     status_line = fp.readline(_KEPLER_HEADER_SIZE).decode("utf-8", errors="replace").strip("\r\n")
     if not status_line:
@@ -762,27 +791,35 @@ GOPHER_ITEM_TYPES: dict[str, str] = {
 
 
 def is_gopher_menu(body: bytes) -> bool:
-    """Return True if the bytes look like a Gopher directory menu."""
-    try:
-        text = body.decode("utf-8", errors="replace")
-    except UnicodeDecodeError:
-        return False
+    """Return True if the bytes look like a Gopher directory menu.
 
-    lines = text.strip().splitlines()
-    if len(lines) < 3 or lines[-1].strip() != ".":
+    Real-world servers are inconsistent about the terminating '.' line and
+    often emit trailing blank lines, so we don't *require* the dot — we
+    accept it as a terminator if present and otherwise judge by line shape.
+    A ratio threshold (≥70% well-formed lines) tolerates a few malformed
+    lines without rejecting the whole menu.
+    """
+    text = body.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+
+    # Strip a trailing '.' terminator and any blank padding around it.
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].strip() == ".":
+        lines.pop()
+
+    if len(lines) < 3:
         return False
 
     valid = 0
     total = 0
-    for line in lines[:-1]:
+    for line in lines:
         if not line.strip():
             continue
         total += 1
-        # Real Gopher menu lines are tab-separated with a 1-char type prefix
-        if line[0] in GOPHER_ITEM_TYPES and "\t" in line:
+        # Real Gopher menu lines are tab-separated with a 1-char type prefix.
+        if line and line[0] in GOPHER_ITEM_TYPES and "\t" in line:
             valid += 1
-        else:
-            return False
 
     return total > 0 and valid >= max(1, total * 0.7)
 
@@ -1265,6 +1302,8 @@ class BrowserCompleter:
         self.matches: list[str] = []
 
     def complete(self, text: str, state: int) -> Optional[str]:
+        if readline is None:
+            return None
         if state == 0:
             line = readline.get_line_buffer()
             words = line.split()
@@ -1361,6 +1400,8 @@ class Browser:
         self._setup_readline()
 
     def _setup_readline(self) -> None:
+        if readline is None:
+            return  # line-editing / tab-completion unavailable; REPL still works
         completer = BrowserCompleter(self)
         readline.set_completer(completer.complete)
         try:
@@ -1757,12 +1798,11 @@ class Browser:
             return
         print()
         print(hr())
-        try:
-            text = self.last_body.decode("utf-8", errors="replace")
-            for line in text.splitlines():
-                print(dim("  " + line))
-        except UnicodeDecodeError:
-            print(red("  Could not display source (binary content)"))
+        # errors="replace" never raises, so no try/except is needed.
+        # Route through _emit_lines so the pager setting is honoured.
+        text = self.last_body.decode("utf-8", errors="replace")
+        lines = [dim("  " + line) for line in text.splitlines()]
+        self._emit_lines(lines)
         print(hr())
         print()
 
@@ -2233,6 +2273,9 @@ class Browser:
         self.current_links = []
         print(yellow(f"  Binary content ({mime or 'unknown'}), {len(body):,} bytes"))
         fname = os.path.basename(url.rstrip("/").split("/")[-1] or "download")
+        # Don't let a server suggest a hidden/dotfile name (e.g. ".bashrc").
+        if not fname or fname.startswith("."):
+            fname = "download"
         if self._confirm(f"  Save as [{fname}]? [y/N]: "):
             if Path(fname).exists() and not self._confirm(f"  {fname} exists. Overwrite? [y/N]: "):
                 print(dim("  Cancelled."))
@@ -2369,9 +2412,15 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
     return table
 
 
-def run_repl(start_url: Optional[str] = None) -> None:
-    """Run the interactive REPL."""
-    config = _load_config()
+def run_repl(config: Config, start_url: Optional[str] = None) -> None:
+    """Run the interactive REPL with an already-resolved Config.
+
+    The caller is responsible for constructing the Config (loading from
+    disk + applying any CLI overrides). We do NOT reload from disk here,
+    so per-invocation CLI flags are honoured without being persisted.
+    """
+    # set_use_color is also called by Browser.__init__, but we set it here too
+    # so any pre-navigation output (banner, errors) honours --no-color.
     set_use_color(config.color)
 
     browser = Browser(config)
@@ -2433,13 +2482,17 @@ def main() -> None:
         "url", nargs="?",
         help="URL to open on start (kepler://, keplers://, spartan://, gemini://, nex://, gopher://, finger://)",
     )
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colours")
-    parser.add_argument("--pager", action="store_true", help="Enable pager mode")
-    parser.add_argument("--home", type=str, help="Set home URL (overrides config)")
-    parser.add_argument("--timeout", type=int, help="Set connection timeout (overrides config)")
-    parser.add_argument("--history-limit", type=int, help="Set max history entries (overrides config)")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colours (this session only)")
+    parser.add_argument("--pager", action="store_true", help="Enable pager mode (this session only)")
+    parser.add_argument("--home", type=str, help="Set home URL (this session only)")
+    parser.add_argument("--timeout", type=int, help="Set connection timeout (this session only)")
+    parser.add_argument("--history-limit", type=int, help="Set max history entries (this session only)")
 
     args = parser.parse_args()
+
+    # Load persisted config, then layer CLI overrides on top *in memory only*.
+    # CLI flags are per-invocation and MUST NOT be written back to config.json;
+    # only the interactive `set` command persists changes.
     config = _load_config()
 
     if args.no_color:
@@ -2463,10 +2516,13 @@ def main() -> None:
         else:
             print(yellow("  Warning: --history-limit must be non-negative."))
 
-    _save_config(config)
+    # Ensure a config file exists on first run, but persist only the on-disk
+    # defaults — never the transient CLI overrides applied above.
+    if not _CONFIG_FILE.exists():
+        _save_config(_load_config())  # writes defaults (or whatever is valid on disk)
 
     try:
-        run_repl(args.url)
+        run_repl(config, args.url)
     except KeyboardInterrupt:
         print()
 
