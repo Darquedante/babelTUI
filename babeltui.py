@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Multi-Protocol Interactive Browser
-Supports kepler://, keplers://, spartan://, gemini://, nex://, gopher://, and finger:// protocols
+Supports kepler://, keplers://, spartan://, gemini://, nex://, gopher://, and finger:// protocols.
+Views RSS 2.0 / RSS 1.0 / Atom feeds and manages feed subscriptions.
 
 Commands: go, back, forward, reload, up, finger, find, links, history,
-          bookmark, bookmarks, source, clear, help, quit, save, set
+          bookmark, bookmarks, source, clear, help, quit, save, set,
+          subscribe, unsubscribe, subscriptions, check
 """
 from __future__ import annotations
 
@@ -12,10 +14,12 @@ import argparse
 import functools
 import getpass
 import hashlib
+import html
 import json
 import mimetypes
 import os
 import re
+import readline
 import shutil
 import socket
 import ssl
@@ -23,7 +27,10 @@ import subprocess
 import sys
 import textwrap
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import (
@@ -34,13 +41,6 @@ from urllib.parse import (
     urlunparse,
 )
 
-# readline is optional: absent on Windows without pyreadline3, or in stripped
-# builds. The REPL still works without it (no line-editing / tab-completion),
-# and getch() already has its own Windows path.
-try:
-    import readline
-except ImportError:  # pragma: no cover - platform dependent
-    readline = None
 
 # ── URL Scheme Registration ─────────────────────────────────────────────────
 #
@@ -53,15 +53,29 @@ except ImportError:  # pragma: no cover - platform dependent
 # Python 2.x and are effectively API even if not formally documented as
 # such. If a future stdlib version breaks this, the defensive fallback
 # in resolve_url() below will catch it.
+#
+# Wrapped in a function and invoked explicitly so that merely *importing*
+# this module as a library does not mutate global stdlib state as a silent
+# import side effect.
 # ────────────────────────────────────────────────────────────────────────────
 from urllib import parse as _urlparse_mod
 
-for _scheme in ("kepler", "keplers", "spartan", "gemini",
-                "nex", "gopher", "gopher-search", "finger", "telnet"):
-    if _scheme not in _urlparse_mod.uses_relative:
-        _urlparse_mod.uses_relative.append(_scheme)
-    if _scheme not in _urlparse_mod.uses_netloc:
-        _urlparse_mod.uses_netloc.append(_scheme)
+_SMOLNET_SCHEMES = (
+    "kepler", "keplers", "spartan", "gemini",
+    "nex", "gopher", "gopher-search", "finger", "telnet",
+)
+
+
+def _register_url_schemes() -> None:
+    """Register smolnet schemes with urllib.parse for RFC 3986 resolution."""
+    for scheme in _SMOLNET_SCHEMES:
+        if scheme not in _urlparse_mod.uses_relative:
+            _urlparse_mod.uses_relative.append(scheme)
+        if scheme not in _urlparse_mod.uses_netloc:
+            _urlparse_mod.uses_netloc.append(scheme)
+
+
+_register_url_schemes()
 
 # Initialize mimetypes for Nex/Gopher extension detection
 mimetypes.init()
@@ -71,6 +85,10 @@ mimetypes.init()
 DEFAULT_TIMEOUT = 15
 _MAX_REDIRECTS = 10
 _MAX_REDIRECTS_KEPLER = 5
+# Independent ceiling on interactive input cycles (1x / Spartan-5 / Gemini-1x).
+# These reset the redirect counter, so without their own cap a hostile server
+# could trap the user in an unbounded prompt loop (issue #1).
+_MAX_INPUT_CYCLES = 20
 _HISTORY_LIMIT = 500
 _HISTORY_SAVE_INTERVAL = 10
 _BUFFER_SIZE = 4096
@@ -81,6 +99,15 @@ _SPARTAN_HEADER_SIZE = 4096
 _GEMINI_HEADER_SIZE = 4096
 _PROMPT_URL_MAX_LEN = 45
 _PROMPT_URL_TAIL_LEN = 30
+
+# Cap response bodies to defend against memory exhaustion from hostile or
+# malfunctioning servers streaming unbounded data.
+_MAX_BODY_SIZE = 50 * 1024 * 1024  # 50 MiB
+
+# Feed limits
+_FEED_MAX_ENTRIES = 200
+_FEED_SUMMARY_MAX = 280
+_FEED_NEW_ENTRIES_SHOWN = 12
 
 # Default ports
 _PORT_KEPLER = 2009
@@ -99,6 +126,7 @@ _BOOKMARK_FILE    = _CONFIG_DIR / "bookmarks.json"
 _HISTORY_FILE     = _CONFIG_DIR / "history.json"
 _KNOWN_HOSTS_FILE = _CONFIG_DIR / "known_hosts.json"
 _CONFIG_FILE      = _CONFIG_DIR / "config.json"
+_FEEDS_FILE       = _CONFIG_DIR / "feeds.json"
 
 
 # ── Atomic JSON I/O ─────────────────────────────────────────────────────────
@@ -106,15 +134,14 @@ _CONFIG_FILE      = _CONFIG_DIR / "config.json"
 def _atomic_write_json(path: Path, data, *, mode: int = 0o600) -> None:
     """Write JSON atomically (write to .tmp, then replace).
 
-    On any failure, the temporary file is removed so we never leave a
-    half-written ``*.tmp`` artefact behind.
+    On any failure after the temp file is created, the orphaned .tmp is
+    unlinked so a crashed/failed write never leaves stale debris behind
+    (issue #8).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         try:
             os.chmod(tmp, mode)
         except OSError:
@@ -122,7 +149,7 @@ def _atomic_write_json(path: Path, data, *, mode: int = 0o600) -> None:
         tmp.replace(path)
     except OSError:
         try:
-            tmp.unlink(missing_ok=True)
+            tmp.unlink()
         except OSError:
             pass
         raise
@@ -146,6 +173,7 @@ class Config:
     history_limit: int = _HISTORY_LIMIT
     color: bool = True
     pager: bool = False
+    feed_compact: bool = False  # hide entry summaries when True
 
     @classmethod
     def from_dict(cls, data: dict) -> Config:
@@ -177,14 +205,34 @@ def _save_config(config: Config) -> None:
 
 @functools.cache
 def _get_user_language() -> str:
-    """Determine user's preferred language per Kepler §8.1.2."""
-    lang = os.environ.get("LANG", "").split(".")[0].replace("_", "-")
+    """Determine user's preferred language per Kepler §8.1.2.
+
+    POSIX locale resolution gives LC_ALL and LC_MESSAGES precedence over
+    LANG; honour that ordering rather than reading LANG alone.
+    """
+    raw = (
+        os.environ.get("LC_ALL")
+        or os.environ.get("LC_MESSAGES")
+        or os.environ.get("LANG")
+        or ""
+    )
+    lang = raw.split(".")[0].replace("_", "-")
     if not lang or lang.upper() in ("C", "POSIX"):
         return "?"
     return lang
 
 
 # ── Known Hosts (TOFU) ──────────────────────────────────────────────────────
+
+def _tofu_key(host: str, port: int) -> str:
+    """Build the known_hosts key.
+
+    TOFU pins must be keyed on host:port, not host alone, so that distinct
+    TLS services on the same hostname (e.g. gemini:1965 and keplers:10009)
+    do not share — or collide on — a single pin.
+    """
+    return f"{host}:{port}"
+
 
 def _load_known_hosts() -> dict[str, str]:
     data = _read_json(_KNOWN_HOSTS_FILE)
@@ -208,9 +256,15 @@ def _get_cert_fingerprint(sock: ssl.SSLSocket) -> str:
 
 
 # ── ANSI Color Helpers ──────────────────────────────────────────────────────
+#
+# _USE_COLOR and _SUPPORTS_ANSI are both seeded from isatty(). We treat
+# ANSI support as a function of *both* user intent (color on) and the
+# output being a TTY, and keep the two flags in sync so that disabling
+# colour also suppresses raw cursor-control escapes.
 
-_USE_COLOR = sys.stdout.isatty()
-_SUPPORTS_ANSI = sys.stdout.isatty()
+_IS_TTY = sys.stdout.isatty()
+_USE_COLOR = _IS_TTY
+_SUPPORTS_ANSI = _IS_TTY
 
 
 def _c(text: str, code: str) -> str:
@@ -255,8 +309,10 @@ def bright_white(t: str) -> str:
 
 
 def set_use_color(enabled: bool) -> None:
-    global _USE_COLOR
+    """Enable/disable colour output and keep ANSI control support in sync."""
+    global _USE_COLOR, _SUPPORTS_ANSI
     _USE_COLOR = enabled
+    _SUPPORTS_ANSI = enabled and _IS_TTY
 
 
 # ── Terminal Helpers ────────────────────────────────────────────────────────
@@ -289,6 +345,22 @@ def clear_screen() -> None:
 def _clear_eol() -> str:
     """ANSI 'erase to end of line' (or empty string if no ANSI support)."""
     return "\033[K" if _SUPPORTS_ANSI else "    "
+
+
+def _interactive_ui_available() -> bool:
+    """True when full-screen interactive UIs (picker/find) are usable."""
+    return _SUPPORTS_ANSI and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+# ── Wire-Safety Helpers ─────────────────────────────────────────────────────
+
+def _strip_crlf(s: str) -> str:
+    """Remove CR/LF (and NUL) from a string before placing it on a request
+    line. Prevents request-line injection / smuggling where attacker- or
+    user-supplied selectors, queries or finger users embed newlines that
+    forge additional protocol lines (issue #7).
+    """
+    return s.replace("\r", "").replace("\n", "").replace("\x00", "")
 
 
 # ── Pager Support ───────────────────────────────────────────────────────────
@@ -359,19 +431,61 @@ def _require_host(parts) -> str:
     return host
 
 
-def _recv_all(sock: socket.socket, buf_size: int = _BUFFER_SIZE) -> bytes:
-    """Read from socket until EOF."""
+def _encode_host(host: str) -> bytes:
+    """Encode a hostname for the wire.
+
+    Python's legacy 'idna' codec (IDNA 2003) rejects perfectly routable
+    hosts — underscores, trailing dots, over-long labels — and needlessly
+    fails for plain ASCII. Prefer a plain ASCII encode and only fall back
+    to IDNA for genuinely non-ASCII names.
+    """
+    try:
+        return host.encode("ascii")
+    except UnicodeEncodeError:
+        pass
+    try:
+        return host.encode("idna")
+    except UnicodeError as exc:
+        raise ValueError(f"Invalid hostname for IDNA encoding: {exc}") from exc
+
+
+def _recv_all(
+    sock: socket.socket,
+    buf_size: int = _BUFFER_SIZE,
+    max_bytes: int = _MAX_BODY_SIZE,
+) -> bytes:
+    """Read from socket until EOF, with a hard ceiling."""
     chunks: list[bytes] = []
+    total = 0
     while True:
         chunk = sock.recv(buf_size)
         if not chunk:
             break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(
+                f"Response exceeds maximum body size ({max_bytes:,} bytes)"
+            )
         chunks.append(chunk)
     return b"".join(chunks)
 
 
-def _read_n_bytes(fp, n: int, buf_size: int = _BUFFER_SIZE) -> bytes:
-    """Read exactly n bytes (or until EOF)."""
+def _read_n_bytes(
+    fp,
+    n: int,
+    buf_size: int = _BUFFER_SIZE,
+    max_bytes: int = _MAX_BODY_SIZE,
+) -> bytes:
+    """Read exactly n bytes (or until EOF).
+
+    `n` is server-declared (Kepler content_length) and therefore
+    attacker-controlled; clamp to max_bytes.
+    """
+    if n > max_bytes:
+        raise ValueError(
+            f"Declared content length {n:,} exceeds maximum body size "
+            f"({max_bytes:,} bytes)"
+        )
     chunks: list[bytes] = []
     remaining = n
     while remaining > 0:
@@ -380,6 +494,23 @@ def _read_n_bytes(fp, n: int, buf_size: int = _BUFFER_SIZE) -> bytes:
             break
         chunks.append(chunk)
         remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_until_eof(fp, max_bytes: int = _MAX_BODY_SIZE) -> bytes:
+    """Read a file-like object to EOF with a size cap."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = fp.read(_BUFFER_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(
+                f"Response exceeds maximum body size ({max_bytes:,} bytes)"
+            )
+        chunks.append(chunk)
     return b"".join(chunks)
 
 
@@ -417,28 +548,39 @@ def _make_tls_context(min_tls_1_2: bool = False) -> ssl.SSLContext:
 def _tofu_check(
     sock: ssl.SSLSocket,
     host: str,
+    port: int,
     known_hosts: dict[str, str],
     accept_new_host: bool,
 ) -> bool:
-    """Verify a TLS cert via TOFU. Returns True if known_hosts was modified."""
+    """Verify a TLS cert via TOFU. Returns True if known_hosts was modified.
+
+    Keys the pin on host:port so distinct services on the same host are
+    pinned independently.
+
+    On first contact with an unknown host we now emit a visible notice that
+    a new certificate has been pinned (issue #6), so the user always has a
+    signal that trust was established silently.
+    """
+    key = _tofu_key(host, port)
     actual_fp = _get_cert_fingerprint(sock)
-    expected_fp = known_hosts.get(host)
+    expected_fp = known_hosts.get(key)
 
     if expected_fp is None:
         if accept_new_host:
-            known_hosts[host] = actual_fp
-            # First contact: surface the pinned fingerprint so the user can
-            # verify it out-of-band if they wish (classic TOFU disclosure).
-            print(dim(f"\n  🔑  Pinned new certificate for {host}"))
-            print(dim(f"      SHA-256: {actual_fp}"))
+            known_hosts[key] = actual_fp
+            short = actual_fp[:16]
+            print(dim(
+                f"\r  🔑  Pinned new certificate for {key} "
+                f"(sha256:{short}…){_clear_eol()}"
+            ))
             return True
-        raise ssl.SSLError(f"Unknown host {host} and accept_new_host=False")
+        raise ssl.SSLError(f"Unknown host {key} and accept_new_host=False")
 
     if actual_fp == expected_fp:
         return False
 
     # Fingerprint mismatch — interactive confirmation required
-    print(bright_red(f"\n  ⚠  WARNING: Certificate fingerprint mismatch for {host}!"))
+    print(bright_red(f"\n  ⚠  WARNING: Certificate fingerprint mismatch for {key}!"))
     print(f"  Expected: {expected_fp}")
     print(f"  Actual:   {actual_fp}")
     if not accept_new_host or not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -450,7 +592,7 @@ def _tofu_check(
         raise ssl.SSLError("User rejected new certificate")
     if ans != "y":
         raise ssl.SSLError("User rejected new certificate")
-    known_hosts[host] = actual_fp
+    known_hosts[key] = actual_fp
     return True
 
 
@@ -489,7 +631,9 @@ def fetch_kepler(
         if use_tls:
             context = _make_tls_context(min_tls_1_2=True)
             with context.wrap_socket(raw_sock, server_hostname=host) as sock:
-                needs_host_save = _tofu_check(sock, host, known_hosts, accept_new_host)
+                needs_host_save = _tofu_check(
+                    sock, host, port, known_hosts, accept_new_host
+                )
                 sock.sendall(request)
                 result = _parse_kepler_response(sock.makefile("rb"))
         else:
@@ -510,15 +654,7 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
 
     We parse defensively: any numeric prefix tokens (up to 3) are
     interpreted as content_length / last_updated / expires in order,
-    and the remainder is treated as the mimetype. This means a minimal
-    success line such as ``20 text/gemini`` is handled correctly, and
-    ``20 1024 text/gemini`` will set content_length=1024 with the other
-    fields left at their -1 defaults.
-
-    Note the all-numeric edge case: a line like ``20 12345`` (no mimetype
-    token) is interpreted as content_length=12345 with mimetype defaulting
-    to text/gemini; _read_n_bytes() degrades gracefully to EOF if the
-    server doesn't actually send that many bytes.
+    and the remainder is treated as the mimetype.
     """
     status_line = fp.readline(_KEPLER_HEADER_SIZE).decode("utf-8", errors="replace").strip("\r\n")
     if not status_line:
@@ -536,12 +672,9 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
         expires = -1
         mimetype = "text/gemini"
 
-        # Split everything after the status code.
         rest_str = tokens[1] if len(tokens) > 1 else ""
         rest = rest_str.split() if rest_str else []
 
-        # Consume leading numeric tokens as the optional metadata triple.
-        # Up to 3 numerics: content_length, last_updated, expires.
         numeric_slots: list[Optional[int]] = [None, None, None]
         consumed = 0
         for i, tok in enumerate(rest[:3]):
@@ -558,7 +691,6 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
         if numeric_slots[2] is not None:
             expires = numeric_slots[2]
 
-        # Whatever remains is the mimetype.
         remaining_tokens = rest[consumed:]
         if remaining_tokens:
             mimetype = " ".join(remaining_tokens)
@@ -566,7 +698,7 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
         if content_length > 0:
             body = _read_n_bytes(fp, content_length)
         else:
-            body = fp.read()
+            body = _read_until_eof(fp)
 
         extras = {
             "last_updated": last_updated,
@@ -601,11 +733,7 @@ def fetch_spartan(url: str, data: bytes, timeout: int) -> tuple[int, str, bytes]
     if not data and query:
         data = query.encode("utf-8")
 
-    try:
-        encoded_host = host.encode("idna")
-    except UnicodeError as exc:
-        raise ValueError(f"Invalid hostname for IDNA encoding: {exc}") from exc
-
+    encoded_host = _encode_host(host)
     encoded_path = quote_from_bytes(unquote_to_bytes(path)).encode("ascii")
 
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -619,13 +747,16 @@ def fetch_spartan(url: str, data: bytes, timeout: int) -> tuple[int, str, bytes]
         if len(tokens) < 1 or not tokens[0]:
             raise ValueError(f"Malformed server response: {response_line!r}")
 
-        try:
-            code = int(tokens[0])
-        except ValueError as exc:
-            raise ValueError(f"Invalid status code: {tokens[0]!r}") from exc
+        # Spartan defines only single-digit status codes (2/3/4/5). Enforce
+        # that rather than accepting e.g. "200" as integer 200 (issue #2),
+        # which previously fell through to a confusing "Unknown code" branch.
+        code_token = tokens[0]
+        if len(code_token) != 1 or not code_token.isdigit():
+            raise ValueError(f"Invalid Spartan status code: {code_token!r}")
+        code = int(code_token)
 
         meta = tokens[1] if len(tokens) > 1 else ""
-        body = fp.read() if code == 2 else b""
+        body = _read_until_eof(fp) if code == 2 else b""
 
     return code, meta, body
 
@@ -654,7 +785,9 @@ def fetch_gemini(
 
     with socket.create_connection((host, port), timeout=timeout) as raw_sock:
         with context.wrap_socket(raw_sock, server_hostname=host) as sock:
-            needs_host_save = _tofu_check(sock, host, known_hosts, accept_new_host)
+            needs_host_save = _tofu_check(
+                sock, host, port, known_hosts, accept_new_host
+            )
             sock.sendall(request)
             fp = sock.makefile("rb")
             status_line = fp.readline(_GEMINI_HEADER_SIZE).decode("ascii", errors="replace").strip("\r\n")
@@ -663,7 +796,7 @@ def fetch_gemini(
             tokens = status_line.split(" ", maxsplit=1)
             code = _parse_status_code(tokens[0])
             meta = tokens[1] if len(tokens) > 1 else ""
-            body = fp.read() if 20 <= code < 30 else b""
+            body = _read_until_eof(fp) if 20 <= code < 30 else b""
 
     if needs_host_save:
         _save_known_hosts(known_hosts)
@@ -706,8 +839,12 @@ def fetch_gopher(
     port = parts.port or _PORT_GOPHER
     selector = parts.path.lstrip("/") if parts.path else ""
 
+    # Sanitise selector/query before building the request line so an
+    # embedded CR/LF cannot forge an extra Gopher request (issue #7).
+    selector = _strip_crlf(selector)
     if query is not None:
-        request = f"{selector}\t{query}\r\n".encode("utf-8")
+        safe_query = _strip_crlf(query)
+        request = f"{selector}\t{safe_query}\r\n".encode("utf-8")
     else:
         request = selector.encode("utf-8") + b"\r\n"
 
@@ -728,6 +865,10 @@ def fetch_finger(url: str, timeout: int) -> tuple[int, str, bytes]:
     port = parts.port or _PORT_FINGER
 
     user = parts.username or parts.path.lstrip("/").strip()
+    # Strip CR/LF from the user token before the request line (issue #7):
+    # a finger:// URL with an embedded newline could otherwise forge a
+    # second query line.
+    user = _strip_crlf(user)
     request = user.encode("utf-8") + b"\r\n"
 
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -791,35 +932,26 @@ GOPHER_ITEM_TYPES: dict[str, str] = {
 
 
 def is_gopher_menu(body: bytes) -> bool:
-    """Return True if the bytes look like a Gopher directory menu.
+    """Return True if the bytes look like a Gopher directory menu."""
+    try:
+        text = body.decode("utf-8", errors="replace")
+    except UnicodeDecodeError:
+        return False
 
-    Real-world servers are inconsistent about the terminating '.' line and
-    often emit trailing blank lines, so we don't *require* the dot — we
-    accept it as a terminator if present and otherwise judge by line shape.
-    A ratio threshold (≥70% well-formed lines) tolerates a few malformed
-    lines without rejecting the whole menu.
-    """
-    text = body.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-
-    # Strip a trailing '.' terminator and any blank padding around it.
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if lines and lines[-1].strip() == ".":
-        lines.pop()
-
-    if len(lines) < 3:
+    lines = text.strip().splitlines()
+    if len(lines) < 3 or lines[-1].strip() != ".":
         return False
 
     valid = 0
     total = 0
-    for line in lines:
+    for line in lines[:-1]:
         if not line.strip():
             continue
         total += 1
-        # Real Gopher menu lines are tab-separated with a 1-char type prefix.
-        if line and line[0] in GOPHER_ITEM_TYPES and "\t" in line:
+        if line[0] in GOPHER_ITEM_TYPES and "\t" in line:
             valid += 1
+        else:
+            return False
 
     return total > 0 and valid >= max(1, total * 0.7)
 
@@ -876,30 +1008,353 @@ def gopher_menu_to_gemtext(body: bytes, base_url: str) -> str:
     return "\n".join(out)
 
 
+# ── Feed Parsing (RSS 2.0 / RSS 1.0 / Atom) ─────────────────────────────────
+#
+# Stdlib-only feed support. We deliberately avoid feedparser to keep this
+# dependency-free, at the cost of hand-rolling namespace and date handling.
+#
+# SECURITY: XML is untrusted input. Python's xml.etree does not resolve
+# external entities by default, but entity-expansion ("billion laughs")
+# and oversized payloads remain concerns. Mitigations here:
+#   * Bodies are already capped at _MAX_BODY_SIZE before we ever parse.
+#   * We reject any document containing a DOCTYPE (<!DOCTYPE …>), which
+#     blocks the entity-definition vector entirely.
+# For stronger guarantees, swap ElementTree for the third-party
+# `defusedxml` package — a drop-in that hardens these same APIs.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Atom uses this namespace; RSS 2.0 is namespace-less; RSS 1.0 (RDF) uses
+# the RSS 1.0 namespace plus Dublin Core for dates.
+_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "rss10": "http://purl.org/rss/1.0/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+}
+
+
+@dataclass
+class FeedEntry:
+    title: str = ""
+    link: str = ""
+    updated: Optional[datetime] = None
+    summary: str = ""
+
+    def identity(self) -> str:
+        """Stable key for new-entry detection (prefer link, fall back to title+date)."""
+        if self.link:
+            return self.link
+        date = self.updated.isoformat() if self.updated else ""
+        return f"{self.title}|{date}"
+
+
+@dataclass
+class Feed:
+    title: str = ""
+    subtitle: str = ""
+    link: str = ""
+    updated: Optional[datetime] = None
+    kind: str = ""  # "atom", "rss", or "rdf"
+    entries: list[FeedEntry] = field(default_factory=list)
+
+
+def looks_like_feed(body: bytes, mime: str, *, require_strong: bool = False) -> bool:
+    """Heuristic: does this look like an RSS/Atom/RDF feed?
+
+    Checks MIME first, then sniffs the leading bytes for a feed root
+    element. Generic application/xml + text/xml only qualify if the
+    sniff confirms a feed root (so we don't hijack arbitrary XML).
+
+    When `require_strong` is True (used for protocols that hand us an
+    empty MIME and arbitrary text bodies, e.g. Gopher type-0 files — see
+    issue #3), we demand an actual feed *root* element at the very start
+    of the document rather than a loose substring match anywhere in the
+    first 512 bytes. This prevents a plain text file that merely mentions
+    "<feed>" or "<rss>" from being hijacked into the feed renderer.
+    """
+    base_mime = (mime or "").split(";")[0].strip().lower()
+
+    if base_mime in ("application/rss+xml", "application/atom+xml",
+                      "application/rdf+xml"):
+        return True
+
+    head = body[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+
+    if require_strong:
+        # Require the document to actually *begin* with an XML declaration
+        # or a feed root element — a much stronger signal than substring
+        # presence. We tolerate a leading <?xml ...?> prolog before the root.
+        probe = head
+        if probe.startswith(b"<?xml"):
+            end = probe.find(b"?>")
+            if end != -1:
+                probe = probe[end + 2:].lstrip(b" \t\r\n")
+        return (
+            probe.startswith(b"<rss")
+            or probe.startswith(b"<feed")
+            or probe.startswith(b"<rdf:rdf")
+        )
+
+    sniffed = (
+        b"<rss" in head
+        or b"<feed" in head
+        or b"<rdf:rdf" in head
+        or (b"<?xml" in head and (b"rss" in head or b"atom" in head))
+    )
+    if base_mime in ("application/xml", "text/xml", ""):
+        return sniffed
+    return False
+
+
+def _strip_ns(tag: str) -> str:
+    """'{namespace}local' -> 'local'."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _feed_text(elem: Optional[ET.Element]) -> str:
+    """Flattened, unescaped, whitespace-normalised text of an element."""
+    if elem is None:
+        return ""
+    raw = "".join(elem.itertext())
+    raw = html.unescape(raw)  # handle CDATA-wrapped HTML entities
+    return " ".join(raw.split())
+
+
+def _parse_feed_date(raw: str) -> Optional[datetime]:
+    """Parse RFC 822 (RSS) or RFC 3339/ISO 8601 (Atom) timestamps."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            return dt
+    except (TypeError, ValueError):
+        pass
+    iso = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
+def _atom_link(entry: ET.Element) -> str:
+    """Pick the best <link> from an Atom element (prefer rel=alternate)."""
+    best = ""
+    for link in entry.findall("atom:link", _NS):
+        rel = link.get("rel", "alternate")
+        href = link.get("href", "")
+        if not href:
+            continue
+        if rel == "alternate":
+            return href
+        if not best and rel in ("", "self"):
+            best = href
+    return best
+
+
+def parse_feed(body: bytes) -> Optional[Feed]:
+    """Parse RSS 2.0, RSS 1.0 (RDF) or Atom bytes into a Feed.
+
+    Returns None if the document is not a parseable feed. Raises
+    ValueError on a hostile DOCTYPE (entity-expansion vector) or
+    malformed XML.
+    """
+    head = body[:2048].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if b"<!DOCTYPE" in head[:512] or b"<!doctype" in head[:512]:
+        raise ValueError("Refusing to parse feed with DOCTYPE declaration")
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise ValueError(f"Malformed XML feed: {exc}") from exc
+
+    root_tag = _strip_ns(root.tag).lower()
+
+    if root_tag == "feed":
+        return _parse_atom(root)
+    if root_tag == "rss":
+        return _parse_rss2(root)
+    if root_tag == "rdf":  # RSS 1.0
+        return _parse_rss1(root)
+    return None
+
+
+def _parse_atom(root: ET.Element) -> Feed:
+    feed = Feed(kind="atom")
+    feed.title = _feed_text(root.find("atom:title", _NS))
+    feed.subtitle = _feed_text(root.find("atom:subtitle", _NS))
+    feed.link = _atom_link(root)
+    feed.updated = _parse_feed_date(_feed_text(root.find("atom:updated", _NS)))
+
+    for entry in root.findall("atom:entry", _NS)[:_FEED_MAX_ENTRIES]:
+        feed.entries.append(FeedEntry(
+            title=_feed_text(entry.find("atom:title", _NS)) or "(untitled)",
+            link=_atom_link(entry),
+            updated=_parse_feed_date(
+                _feed_text(entry.find("atom:updated", _NS))
+                or _feed_text(entry.find("atom:published", _NS))
+            ),
+            summary=_feed_text(entry.find("atom:summary", _NS))
+                    or _feed_text(entry.find("atom:content", _NS)),
+        ))
+    return feed
+
+
+def _parse_rss2(root: ET.Element) -> Feed:
+    channel = root.find("channel")
+    feed = Feed(kind="rss")
+    if channel is None:
+        return feed
+    feed.title = _feed_text(channel.find("title"))
+    feed.subtitle = _feed_text(channel.find("description"))
+    feed.link = _feed_text(channel.find("link"))
+    feed.updated = _parse_feed_date(
+        _feed_text(channel.find("lastBuildDate")) or _feed_text(channel.find("pubDate"))
+    )
+
+    for item in channel.findall("item")[:_FEED_MAX_ENTRIES]:
+        feed.entries.append(FeedEntry(
+            title=_feed_text(item.find("title")) or "(untitled)",
+            link=_feed_text(item.find("link")),
+            updated=_parse_feed_date(
+                _feed_text(item.find("pubDate"))
+                or _feed_text(item.find("dc:date", _NS))
+            ),
+            summary=_feed_text(item.find("description")),
+        ))
+    return feed
+
+
+def _parse_rss1(root: ET.Element) -> Feed:
+    feed = Feed(kind="rdf")
+    channel = root.find("rss10:channel", _NS)
+    if channel is not None:
+        feed.title = _feed_text(channel.find("rss10:title", _NS))
+        feed.subtitle = _feed_text(channel.find("rss10:description", _NS))
+        feed.link = _feed_text(channel.find("rss10:link", _NS))
+        feed.updated = _parse_feed_date(_feed_text(channel.find("dc:date", _NS)))
+
+    for item in root.findall("rss10:item", _NS)[:_FEED_MAX_ENTRIES]:
+        feed.entries.append(FeedEntry(
+            title=_feed_text(item.find("rss10:title", _NS)) or "(untitled)",
+            link=_feed_text(item.find("rss10:link", _NS)),
+            updated=_parse_feed_date(_feed_text(item.find("dc:date", _NS))),
+            summary=_feed_text(item.find("rss10:description", _NS)),
+        ))
+    return feed
+
+
+def _fmt_feed_date(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _entry_sort_key(entry: FeedEntry):
+    """Sort newest-first; entries without a date sort last."""
+    if entry.updated is None:
+        return (0, datetime.min.replace(tzinfo=timezone.utc))
+    dt = entry.updated
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (1, dt)
+
+
+def feed_to_gemtext(feed: Feed, base_url: str, summaries: bool = True) -> str:
+    """Render a parsed Feed as gemtext.
+
+    Reuses the existing gemtext renderer downstream, so feeds get
+    link-numbering, find, save, pager etc. for free. Entry links are
+    resolved against the feed URL so relative hrefs work.
+    """
+    out: list[str] = []
+    kind_label = {"atom": "Atom", "rss": "RSS", "rdf": "RSS 1.0"}.get(feed.kind, "Feed")
+
+    out.append(f"# {feed.title or '(untitled feed)'}")
+    out.append("")
+    meta_bits = [kind_label, f"{len(feed.entries)} entries"]
+    if feed.updated:
+        meta_bits.append(f"updated {_fmt_feed_date(feed.updated)}")
+    out.append("> " + " · ".join(meta_bits))
+    if feed.subtitle:
+        out.append(f"> {feed.subtitle}")
+    if feed.link:
+        out.append(f"=> {resolve_url(base_url, feed.link)} Feed homepage")
+    out.append("")
+
+    entries = sorted(feed.entries, key=_entry_sort_key, reverse=True)
+    if not entries:
+        out.append("(This feed contains no entries.)")
+        return "\n".join(out)
+
+    for entry in entries:
+        date = _fmt_feed_date(entry.updated)
+        out.append(f"## {entry.title}")
+        if entry.link:
+            out.append(f"=> {resolve_url(base_url, entry.link)} Read entry")
+        if date:
+            out.append(date)
+        if summaries and entry.summary:
+            summary = entry.summary
+            if len(summary) > _FEED_SUMMARY_MAX:
+                summary = summary[:_FEED_SUMMARY_MAX - 1].rstrip() + "…"
+            out.append(summary)
+        out.append("")
+
+    return "\n".join(out)
+
+
+# ── Subscription Persistence ─────────────────────────────────────────────────
+#
+# Feeds are stored as a dict keyed by feed URL. Each record tracks a
+# human title, the set of entry identities already seen, the last
+# successful check time, and an `unread` count so the subscription
+# picker badge survives across a check → subs sequence (issue #10).
+# New-entry detection compares freshly-fetched entry identities against
+# the stored "seen" set.
+
+def _load_subscriptions() -> dict[str, dict]:
+    data = _read_json(_FEEDS_FILE)
+    if isinstance(data, dict):
+        out: dict[str, dict] = {}
+        for url, rec in data.items():
+            if not isinstance(rec, dict):
+                continue
+            seen = rec.get("seen", [])
+            out[str(url)] = {
+                "title": str(rec.get("title", "")),
+                "seen": [str(s) for s in seen] if isinstance(seen, list) else [],
+                "last_checked": _try_int(str(rec.get("last_checked", 0)), 0),
+                "unread": max(0, _try_int(str(rec.get("unread", 0)), 0)),
+            }
+        return out
+    return {}
+
+
+def _save_subscriptions(subs: dict[str, dict]) -> None:
+    try:
+        _atomic_write_json(_FEEDS_FILE, subs)
+    except OSError as exc:
+        print(yellow(f"  Warning: could not save subscriptions: {exc}"))
+
+
 # ── URL Resolution ──────────────────────────────────────────────────────────
 
 def resolve_url(base: str, link: str) -> str:
-    """Resolve a relative link against the base URL using RFC 3986 rules.
-
-    Delegates to urllib.parse.urljoin, which (after our scheme registration
-    at module load) handles smolnet schemes correctly. As a defence in
-    depth, if urljoin returns a schemeless reference — which would indicate
-    either the registration failed or a future stdlib version changed
-    behaviour — we fall back to a manual netloc-based join.
-    """
-    # If the link is already absolute, urljoin returns it unchanged.
+    """Resolve a relative link against the base URL using RFC 3986 rules."""
     resolved = urljoin(base, link)
 
-    # Defensive fallback: if no scheme survived, do it by hand.
     if "://" not in resolved and "://" in base:
         base_parts = urlparse(base)
         if not base_parts.scheme or not base_parts.netloc:
-            return resolved  # nothing more we can do
+            return resolved
         if link.startswith("//"):
             return f"{base_parts.scheme}:{link}"
         if link.startswith("/"):
             return f"{base_parts.scheme}://{base_parts.netloc}{link}"
-        # Relative path — join against base's directory
         base_path = base_parts.path or "/"
         base_dir = base_path.rsplit("/", 1)[0] if "/" in base_path else ""
         new_path = f"{base_dir}/{link}" if base_dir else f"/{link}"
@@ -912,6 +1367,17 @@ def replace_query(url: str, new_query: str) -> str:
     """Replace the query component of a URL (preserves fragment)."""
     p = urlparse(url)
     return urlunparse(p._replace(query=new_query))
+
+
+def _safe_filename_from_url(url: str, default: str = "page.dat") -> str:
+    """Derive a safe local filename from a URL (no query/fragment)."""
+    parts = urlparse(url)
+    path = parts.path or ""
+    candidate = path.rstrip("/").rsplit("/", 1)[-1]
+    candidate = os.path.basename(candidate)
+    if not candidate or candidate in (".", "..") or candidate.startswith("."):
+        return default
+    return candidate
 
 
 # ── Gemtext Renderer ────────────────────────────────────────────────────────
@@ -1042,7 +1508,7 @@ def getch() -> str:
             return {
                 'H': '\x1b[A', 'P': '\x1b[B',
                 'M': '\x1b[C', 'K': '\x1b[D',
-            }.get(ch2, ch2)
+            }.get(ch2, '')
         return ch
 
     import select
@@ -1054,17 +1520,22 @@ def getch() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == '\x1b':
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch2 = sys.stdin.read(1)
-                if ch2 == '[':
-                    seq = ''
-                    while select.select([sys.stdin], [], [], 0.05)[0]:
-                        ch3 = sys.stdin.read(1)
-                        if not ch3 or ch3.isalpha() or ch3 in '~':
-                            return '\x1b[' + seq + ch3
-                        seq += ch3
-                    return '\x1b[' + seq
-                return '\x1b' + ch2
+            # Distinguish a bare ESC (no following byte within the window)
+            # from a CSI/SS3 escape sequence. If nothing is immediately
+            # available, treat it as a standalone ESC so a lone ESC keypress
+            # is never merged with subsequently-typed input (issue #9).
+            if not select.select([sys.stdin], [], [], 0.05)[0]:
+                return '\x1b'
+            ch2 = sys.stdin.read(1)
+            if ch2 == '[':
+                seq = ''
+                while select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch3 = sys.stdin.read(1)
+                    if not ch3 or ch3.isalpha() or ch3 in '~':
+                        return '\x1b[' + seq + ch3
+                    seq += ch3
+                return '\x1b[' + seq
+            return '\x1b' + ch2
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1270,6 +1741,43 @@ def _bookmark_mode(
     return items[idx] if idx is not None else None
 
 
+def _subscription_mode(
+    subs: dict[str, dict],
+    new_counts: Optional[dict[str, int]] = None,
+) -> Optional[str]:
+    """Interactive subscription picker. Returns the selected feed URL.
+
+    The unread badge prefers an explicit `new_counts` mapping (a freshly
+    completed check), and otherwise falls back to the persisted per-feed
+    `unread` count so the badge survives a `check` → `subs` sequence even
+    when the caller doesn't thread counts through (issue #10).
+    """
+    items = list(subs.items())
+    if not items:
+        print(yellow("  No feed subscriptions yet."))
+        return None
+    new_counts = new_counts or {}
+
+    def render(i: int, item, num_width: int, is_cursor: bool) -> list[str]:
+        url, rec = item
+        w = term_width()
+        title = rec.get("title") or url
+        name_max = max(20, (w // 2) - 10)
+        url_max = max(20, (w // 2) - 10)
+        title_disp = title if len(title) <= name_max else title[:name_max - 1] + "…"
+        url_disp = url if len(url) <= url_max else url[:url_max - 1] + "…"
+        num = str(i + 1).rjust(num_width)
+        n_new = new_counts.get(url, rec.get("unread", 0))
+        badge = bright_green(f" ●{n_new} new") if n_new else ""
+        if is_cursor:
+            return [f"  {bright_cyan('▶')} {bright_cyan(num)}  "
+                    f"{bright_white(title_disp.ljust(name_max))}  {dim(url_disp)}{badge}"]
+        return [f"    {dim(num)}  {title_disp.ljust(name_max)}  {dim(url_disp)}{badge}"]
+
+    idx = _interactive_picker(items, "Feed Subscriptions", render)
+    return items[idx][0] if idx is not None else None
+
+
 # ── Tab Completion ──────────────────────────────────────────────────────────
 
 class BrowserCompleter:
@@ -1290,20 +1798,21 @@ class BrowserCompleter:
         'bookmark', 'bm', 'mark',
         'bookmarks', 'bms', 'marks',
         'open', 'ob', 'delbm', 'rmbm',
+        'subscribe', 'sub', 'unsubscribe', 'unsub',
+        'subscriptions', 'subs', 'feeds', 'check',
         'save', 'set', 'clear',
         'help', '?', 'h',
         'quit', 'q', 'exit', 'bye',
     ]
     NAV_CMDS = {'go', 'visit', 'navigate', 'g', 'open', 'ob'}
     DELBM_CMDS = {'delbm', 'rmbm'}
+    UNSUB_CMDS = {'unsubscribe', 'unsub'}
 
     def __init__(self, browser: Browser):
         self.browser = browser
         self.matches: list[str] = []
 
     def complete(self, text: str, state: int) -> Optional[str]:
-        if readline is None:
-            return None
         if state == 0:
             line = readline.get_line_buffer()
             words = line.split()
@@ -1313,7 +1822,7 @@ class BrowserCompleter:
             else:
                 cmd = words[0].lower() if words else ""
                 if not text:
-                    matches = []  # avoid spamming completions on empty
+                    matches = []
                 elif cmd in self.NAV_CMDS:
                     candidates = (
                         list(self.browser.bookmarks.values())
@@ -1322,8 +1831,11 @@ class BrowserCompleter:
                     matches = [c for c in candidates if c.startswith(text)]
                 elif cmd in self.DELBM_CMDS:
                     matches = [c for c in self.browser.bookmarks if c.startswith(text)]
+                elif cmd in self.UNSUB_CMDS:
+                    matches = [c for c in self.browser.subscriptions if c.startswith(text)]
                 elif cmd == 'set':
-                    options = ['pager', 'home', 'timeout', 'color', 'history_limit']
+                    options = ['pager', 'home', 'timeout', 'color',
+                               'history_limit', 'feed_compact']
                     matches = [c for c in options if c.startswith(text)]
                 else:
                     matches = []
@@ -1337,25 +1849,16 @@ class BrowserCompleter:
 
 @dataclass
 class HandlerResult:
-    """Result of handling a protocol response.
-
-    Fields:
-        done:            If True, stop the fetch loop.
-        redirect_to:     If set, fetch this URL next.
-        new_url:         If set, replaces current_url for the next iteration
-                         (used by input substitution).
-        reset_redirects: If True, reset redirect depth and visited set
-                         (because the next request represents new user intent,
-                         e.g. submitting input).
-        data:            Request body bytes to send with the next fetch
-                         (e.g. for Spartan code 5 input prompts). Defaults
-                         to empty.
-    """
+    """Result of handling a protocol response."""
     done: bool = True
     redirect_to: Optional[str] = None
     new_url: Optional[str] = None
     reset_redirects: bool = False
     data: bytes = b""
+    # Set True by handlers that issued an interactive input prompt, so the
+    # fetch loop can apply an independent interaction-cycle ceiling even
+    # though such results reset the redirect counter (issue #1).
+    is_input_cycle: bool = False
 
 
 # ── Browser Class ───────────────────────────────────────────────────────────
@@ -1374,8 +1877,14 @@ class Browser:
         self.last_mime: Optional[str] = None
         self.bookmarks: dict[str, str] = _load_bookmarks()
         self.known_hosts: dict[str, str] = _load_known_hosts()
+        self.subscriptions: dict[str, dict] = _load_subscriptions()
         self.history_save_counter: int = 0
         self.pager_enabled: bool = self.config.pager
+        self.feed_compact: bool = self.config.feed_compact
+
+        # Tracks whether the currently displayed page is a feed, and its URL,
+        # so `subscribe` with no arg can subscribe to the current feed.
+        self.current_is_feed: bool = False
 
         # Dispatch tables
         self._fetchers: dict[str, Callable] = {
@@ -1400,8 +1909,6 @@ class Browser:
         self._setup_readline()
 
     def _setup_readline(self) -> None:
-        if readline is None:
-            return  # line-editing / tab-completion unavailable; REPL still works
         completer = BrowserCompleter(self)
         readline.set_completer(completer.complete)
         try:
@@ -1428,6 +1935,15 @@ class Browser:
     def flush_history(self) -> None:
         _save_history(self.history, self.config.history_limit)
         self.history_save_counter = 0
+
+    def _truncate_history_in_memory(self, limit: int) -> None:
+        """Trim in-memory history to `limit`, keeping hist_pos consistent."""
+        if limit < 0:
+            return
+        if len(self.history) > limit:
+            drop = len(self.history) - limit
+            self.history = self.history[drop:]
+            self.hist_pos = max(-1, self.hist_pos - drop)
 
     def close(self) -> None:
         """Flush state to disk."""
@@ -1465,6 +1981,18 @@ class Browser:
             raise ValueError(f"Unsupported scheme: {scheme!r}")
         return fetcher(url, data)
 
+    def _fetch_raw(self, url: str) -> tuple[int, str, bytes, dict]:
+        """Fetch a URL once (no redirect/input handling). Used by the feed
+        checker so it doesn't disturb browsing state or prompt interactively.
+        Follows a single redirect best-effort for convenience."""
+        scheme = urlparse(url).scheme
+        code, meta, body, extras = self._fetch_url(url)
+        # Best-effort single redirect follow for feeds (3x across protocols).
+        if scheme in ("gemini", "spartan", "kepler", "keplers") and 30 <= code < 40 and meta.strip():
+            target = resolve_url(url, meta.strip())
+            code, meta, body, extras = self._fetch_url(target)
+        return code, meta, body, extras
+
     # ── Public Navigation ───────────────────────────────────────────────────
 
     def navigate(self, url: str, push_history: bool = True) -> None:
@@ -1500,6 +2028,7 @@ class Browser:
             print(yellow("  Already at the root — can't go higher."))
             return
         parent = path.rsplit("/", 1)[0] + "/"
+        # netloc preserves any non-default port, so this correctly retains it.
         up_url = f"{parts.scheme}://{parts.netloc}{parent}"
         print(dim(f"  ↑  {up_url}"))
         self.navigate(up_url)
@@ -1558,7 +2087,6 @@ class Browser:
             return
 
         if any(url.startswith(s) for s in SUPPORTED_SCHEMES):
-            # §4.7.1: warn on TLS→plaintext for Kepler
             if (self.current_url
                     and self.current_url.startswith("keplers://")
                     and url.startswith("kepler://")):
@@ -1595,6 +2123,7 @@ class Browser:
             return
 
         try:
+            # fetch_gopher strips CR/LF from the query internally (issue #7).
             code, meta, body = fetch_gopher(base_url, self._get_timeout(), query=query)
             if code == 2:
                 self._handle_success(base_url, body, "", push_history=True)
@@ -1668,7 +2197,7 @@ class Browser:
             print(red(f"  No bookmark named {name!r}"))
 
     def bookmark_picker(self) -> None:
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if _interactive_ui_available():
             result = _bookmark_mode(self.bookmarks, self.current_url)
             if result:
                 name, url = result
@@ -1676,6 +2205,224 @@ class Browser:
                 self.navigate(url)
         else:
             self.show_bookmarks()
+
+    # ── Feed Subscriptions ──────────────────────────────────────────────────
+
+    def subscribe(self, url_arg: str = "") -> None:
+        """Subscribe to a feed. With no arg, subscribes to the current page
+        if it is a feed. Records existing entries as 'seen' so the first
+        `check` only reports genuinely new items."""
+        url = url_arg.strip()
+        if not url:
+            if self.current_is_feed and self.current_url:
+                url = self.current_url
+            else:
+                print(yellow("  Usage: subscribe <feed-url>   "
+                             "(or run with no arg while viewing a feed)"))
+                return
+        else:
+            try:
+                url = normalise_url(url)
+            except ValueError as e:
+                print(yellow(f"  {e}"))
+                return
+
+        if url in self.subscriptions:
+            print(yellow(f"  Already subscribed to {url}"))
+            return
+
+        print(dim(f"  ⟳  Fetching feed {url} …"))
+        try:
+            code, meta, body, _ = self._fetch_raw(url)
+        except (OSError, ValueError, ssl.SSLError) as exc:
+            print(bright_red(f"  ✗  Could not fetch feed: {exc}"))
+            return
+
+        if not (code == 2 or (20 <= code < 30)):
+            print(bright_red(f"  ✗  Feed fetch failed (status {code}): {meta}"))
+            return
+
+        try:
+            feed = parse_feed(body)
+        except ValueError as exc:
+            print(bright_red(f"  ✗  Not a parseable feed: {exc}"))
+            return
+        if feed is None:
+            print(bright_red("  ✗  That URL does not appear to be an RSS/Atom feed."))
+            return
+
+        seen = [e.identity() for e in feed.entries]
+        self.subscriptions[url] = {
+            "title": feed.title or url,
+            "seen": seen,
+            "last_checked": int(time.time()),
+            "unread": 0,
+        }
+        _save_subscriptions(self.subscriptions)
+        print(green(f"  ✓  Subscribed to {bold(feed.title or url)} "
+                    f"({len(feed.entries)} entries)"))
+
+    def unsubscribe(self, identifier: str) -> None:
+        identifier = identifier.strip()
+        if not identifier:
+            print(yellow("  Usage: unsubscribe <n|url>"))
+            return
+        # Numeric index into the subscription list?
+        try:
+            idx = int(identifier) - 1
+            urls = list(self.subscriptions.keys())
+            if 0 <= idx < len(urls):
+                url = urls[idx]
+                title = self.subscriptions[url].get("title", url)
+                del self.subscriptions[url]
+                _save_subscriptions(self.subscriptions)
+                print(green(f"  ✓  Unsubscribed from {title}"))
+                return
+            print(red(f"  No subscription [{identifier}] — "
+                      f"valid range is 1–{len(urls)}."))
+            return
+        except ValueError:
+            pass
+        if identifier in self.subscriptions:
+            title = self.subscriptions[identifier].get("title", identifier)
+            del self.subscriptions[identifier]
+            _save_subscriptions(self.subscriptions)
+            print(green(f"  ✓  Unsubscribed from {title}"))
+        else:
+            print(red(f"  Not subscribed to {identifier!r}"))
+
+    def show_subscriptions(self, new_counts: Optional[dict[str, int]] = None) -> None:
+        if not self.subscriptions:
+            print(yellow("  No feed subscriptions yet. Use 'subscribe <url>'."))
+            return
+        if _interactive_ui_available():
+            url = _subscription_mode(self.subscriptions, new_counts)
+            if url:
+                print(dim(f"  Opening {url}…"))
+                self.navigate(url)
+            return
+        new_counts = new_counts or {}
+        print()
+        print(bold("  Feed subscriptions:"))
+        print()
+        for i, (url, rec) in enumerate(self.subscriptions.items(), 1):
+            title = rec.get("title") or url
+            # Prefer freshly-supplied counts, fall back to persisted unread.
+            n_new = new_counts.get(url, rec.get("unread", 0))
+            badge = bright_green(f"  ●{n_new} new") if n_new else ""
+            print(f"  {bright_cyan(f'[{i}]')} {bold(title)}{badge}")
+            print(f"       {dim(url)}")
+        print()
+
+    def check_feeds(self) -> None:
+        """Re-fetch every subscribed feed and report new entries since the
+        last check. Updates each feed's 'seen' set, 'unread' count, and
+        'last_checked' time."""
+        if not self.subscriptions:
+            print(yellow("  No feed subscriptions to check. Use 'subscribe <url>'."))
+            return
+
+        new_counts: dict[str, int] = {}
+        all_new: list[tuple[str, FeedEntry]] = []  # (feed_title, entry)
+        total = len(self.subscriptions)
+
+        print(bold(f"\n  Checking {total} feed(s)…\n"))
+
+        for url, rec in list(self.subscriptions.items()):
+            title = rec.get("title") or url
+            print(dim(f"  ⟳  {title}"), end="", flush=True)
+            try:
+                code, meta, body, _ = self._fetch_raw(url)
+            except (OSError, ValueError, ssl.SSLError) as exc:
+                print(f"\r{yellow(f'  ⚠  {title}: {exc}')}{_clear_eol()}")
+                continue
+
+            if not (code == 2 or (20 <= code < 30)):
+                print(f"\r{yellow(f'  ⚠  {title}: status {code} {meta}')}{_clear_eol()}")
+                continue
+
+            try:
+                feed = parse_feed(body)
+            except ValueError as exc:
+                print(f"\r{yellow(f'  ⚠  {title}: {exc}')}{_clear_eol()}")
+                continue
+            if feed is None:
+                print(f"\r{yellow(f'  ⚠  {title}: not a parseable feed')}{_clear_eol()}")
+                continue
+
+            seen_set = set(rec.get("seen", []))
+            fresh = [e for e in feed.entries if e.identity() not in seen_set]
+            fresh.sort(key=_entry_sort_key, reverse=True)
+
+            n_new = len(fresh)
+            new_counts[url] = n_new
+            for entry in fresh:
+                all_new.append((feed.title or title, entry))
+
+            # Update stored state: title may have changed; merge seen ids.
+            # Persist `unread` so the subscription picker badge survives a
+            # later `subs` invocation that doesn't thread counts (issue #10).
+            prev_unread = max(0, _try_int(str(rec.get("unread", 0)), 0))
+            merged_seen = list(seen_set | {e.identity() for e in feed.entries})
+            self.subscriptions[url] = {
+                "title": feed.title or title,
+                "seen": merged_seen[-(_FEED_MAX_ENTRIES * 4):],  # bound growth
+                "last_checked": int(time.time()),
+                "unread": prev_unread + n_new,
+            }
+
+            badge = bright_green(f"{n_new} new") if n_new else dim("up to date")
+            print(f"\r  {green('✓')}  {title}  [{badge}]{_clear_eol()}")
+
+        _save_subscriptions(self.subscriptions)
+
+        total_new = sum(new_counts.values())
+        print()
+        print(hr())
+        if total_new == 0:
+            print(green("\n  ✓  All feeds up to date — no new entries.\n"))
+            return
+
+        # Render the aggregated new entries as a gemtext "river" so the
+        # user can open any of them by number.
+        all_new.sort(key=lambda fe: _entry_sort_key(fe[1]), reverse=True)
+        shown = all_new[:max(_FEED_NEW_ENTRIES_SHOWN, total_new)]
+
+        out: list[str] = [f"# {total_new} new feed entr"
+                          f"{'y' if total_new == 1 else 'ies'}", ""]
+        last_feed = None
+        for feed_title, entry in shown:
+            if feed_title != last_feed:
+                out.append(f"## {feed_title}")
+                last_feed = feed_title
+            date = _fmt_feed_date(entry.updated)
+            label = entry.title or "(untitled)"
+            if entry.link:
+                suffix = f"  —  {date}" if date else ""
+                out.append(f"=> {entry.link} {label}{suffix}")
+            else:
+                out.append(f"* {label}{('  —  ' + date) if date else ''}")
+            out.append("")
+
+        # Render as a synthetic page so links are numbered and openable.
+        base = next(iter(self.subscriptions), "gemini://localhost/")
+        gemtext = "\n".join(out)
+        lines, links = render_gemtext(gemtext, base)
+        self.current_url = None
+        self.current_is_feed = False
+        self.last_body = gemtext.encode("utf-8")
+        self.last_mime = "text/gemini"
+        self.current_links = links
+        self.current_render_lines = lines
+
+        print()
+        self._emit_lines(lines)
+        print()
+        print(hr())
+        print(dim(
+            f"\n  {len(links)} new entr{'y' if len(links) == 1 else 'ies'} — "
+            f"type a number to open, or 'subs' for the feed list.\n"
+        ))
 
     # ── Display Helpers ─────────────────────────────────────────────────────
 
@@ -1699,7 +2446,7 @@ class Browser:
         if not self.history:
             print(yellow("  History is empty."))
             return
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if _interactive_ui_available():
             idx = _history_mode(self.history, self.hist_pos)
             if idx is not None:
                 self.hist_pos = idx
@@ -1774,7 +2521,7 @@ class Browser:
             return
         if not filename:
             if self.current_url:
-                filename = self.current_url.rstrip("/").split("/")[-1] or "page.dat"
+                filename = _safe_filename_from_url(self.current_url)
             else:
                 filename = "page.dat"
         filename = os.path.basename(filename)
@@ -1798,11 +2545,12 @@ class Browser:
             return
         print()
         print(hr())
-        # errors="replace" never raises, so no try/except is needed.
-        # Route through _emit_lines so the pager setting is honoured.
-        text = self.last_body.decode("utf-8", errors="replace")
-        lines = [dim("  " + line) for line in text.splitlines()]
-        self._emit_lines(lines)
+        try:
+            text = self.last_body.decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                print(dim("  " + line))
+        except UnicodeDecodeError:
+            print(red("  Could not display source (binary content)"))
         print(hr())
         print()
 
@@ -1820,7 +2568,7 @@ class Browser:
         print()
 
         def row(cmd: str, desc: str) -> None:
-            print(f"  {cyan(cmd.ljust(26))} {desc}")
+            print(f"  {cyan(cmd.ljust(28))} {desc}")
 
         print(bold("  Navigation"))
         row("go <url>",            "Navigate to any supported URL")
@@ -1839,6 +2587,13 @@ class Browser:
         row("save [file]",         "Save current page")
         row("url",                 "Show current URL")
         print()
+        print(bold("  Feeds (RSS / Atom)"))
+        row("subscribe [url]",     "Subscribe to a feed (or current page)")
+        row("unsubscribe <n|url>", "Remove a subscription")
+        row("subscriptions / subs","List feed subscriptions")
+        row("check",               "Check all feeds for new entries")
+        print(dim("  (Feeds are auto-detected and rendered when you open them.)"))
+        print()
         print(bold("  History & Bookmarks"))
         row("history  /  hist",    "Browse history")
         row("delh <n>",            "Delete history entry")
@@ -1851,9 +2606,23 @@ class Browser:
         print(bold("  Configuration"))
         row("set pager on|off",    "Enable/disable pager")
         row("set color on|off",    "Enable/disable colors")
+        row("set feed_compact on|off", "Hide/show feed entry summaries")
         row("set home <url>",      "Set home page")
         row("set timeout <secs>",  "Set connection timeout")
         row("set history_limit <n>", "Set max history entries")
+        print()
+        print(bold("  Security note"))
+        print(dim("  TLS uses Trust-On-First-Use certificate pinning (per host:port)."))
+        print(dim("  A notice is printed whenever a new certificate is pinned."))
+        print(dim("  Certificate chain and EXPIRY are NOT verified; only the"))
+        print(dim("  fingerprint is pinned. This matches smolnet conventions but"))
+        print(dim("  means an expired-yet-unchanged cert is accepted silently."))
+        print(dim("  Feeds are XML: DOCTYPE declarations are rejected and bodies"))
+        print(dim("  are size-capped to mitigate XML-bomb / XXE attacks."))
+        print()
+        print(bold("  Input"))
+        print(dim("  Bare-hostname input (e.g. 'example.com') defaults to the"))
+        print(dim("  scheme of your home page; use a full URL to force another."))
         print()
         print(bold("  Misc"))
         row("clear",               "Clear the screen")
@@ -1897,6 +2666,20 @@ class Browser:
             _save_config(self.config)
             print(green(f"  ✓  Colors {'enabled' if self.config.color else 'disabled'}"))
 
+        elif option == "feed_compact":
+            if value in bool_on:
+                self.feed_compact = True
+                self.config.feed_compact = True
+            elif value in bool_off:
+                self.feed_compact = False
+                self.config.feed_compact = False
+            else:
+                print(yellow("  Usage: set feed_compact on|off"))
+                return
+            _save_config(self.config)
+            print(green(f"  ✓  Feed compact mode "
+                        f"{'on (summaries hidden)' if self.feed_compact else 'off (summaries shown)'}"))
+
         elif option == "home":
             try:
                 _ = normalise_url(value)
@@ -1923,6 +2706,7 @@ class Browser:
                 limit = int(value)
                 if limit >= 0:
                     self.config.history_limit = limit
+                    self._truncate_history_in_memory(limit)
                     self.flush_history()
                     _save_config(self.config)
                     print(green(f"  ✓  History limit set to {limit} entries"))
@@ -1947,10 +2731,6 @@ class Browser:
             print(bright_red(f"\n  ✗  Client error ({code}): {meta}\n"))
             return HandlerResult(done=True)
         if code == 5:
-            # Spartan input request: prompt the user and re-issue the
-            # request with the typed text as the request body. The
-            # `data` field on HandlerResult carries the bytes through
-            # to the next iteration of the fetch loop.
             user_input = self._prompt_input(meta or "Input")
             if user_input is None or user_input == "":
                 return HandlerResult(done=True)
@@ -1961,6 +2741,7 @@ class Browser:
                 new_url=current_url,
                 reset_redirects=True,
                 data=payload,
+                is_input_cycle=True,
             )
         print(bright_red(f"\n  ✗  Unknown Spartan code {code}: {meta}\n"))
         return HandlerResult(done=True)
@@ -1968,7 +2749,6 @@ class Browser:
     def _handle_kepler(self, code, meta, body, extras, current_url, push_history):
         scheme = urlparse(current_url).scheme
 
-        # 1x — Input
         if 10 <= code < 20:
             sensitive = (code == 11)
             user_input = self._prompt_input(meta or "Input", sensitive=sensitive)
@@ -1982,9 +2762,9 @@ class Browser:
                 redirect_to=new_url,
                 new_url=new_url,
                 reset_redirects=True,
+                is_input_cycle=True,
             )
 
-        # 2x — Success
         if 20 <= code < 30:
             mime_part = meta.split(";")[0].strip().lower() if meta else "text/gemini"
             expires = extras.get("expires", -1)
@@ -1993,7 +2773,6 @@ class Browser:
             self._handle_success(current_url, body, mime_part, push_history)
             return HandlerResult(done=True)
 
-        # 3x — Redirect
         if 30 <= code < 40:
             target = meta.strip()
             if not target:
@@ -2008,7 +2787,6 @@ class Browser:
             print(yellow(f"  ⟶  {label} → {redirect_url}"))
             return HandlerResult(done=False, redirect_to=redirect_url)
 
-        # 4x/5x/6x error tables
         errors = {
             40: "Unspecified temporary failure", 41: "Server unavailable",
             42: "CGI error", 43: "Proxy error", 44: "Slow down",
@@ -2024,7 +2802,6 @@ class Browser:
                 print(yellow("  Client certificates are not yet supported.\n"))
             return HandlerResult(done=True)
 
-        # 7x — Cache unchanged
         if 70 <= code < 80:
             print(yellow("\n  ℹ  Server reports document unchanged (cached version valid)."))
             print(dim("     (This browser does not cache; use reload to force fetch)\n"))
@@ -2045,7 +2822,8 @@ class Browser:
             encoded = quote_from_bytes(user_input.encode("utf-8"), safe=b"")
             new_url = replace_query(current_url, encoded)
             return HandlerResult(
-                done=False, redirect_to=new_url, new_url=new_url, reset_redirects=True,
+                done=False, redirect_to=new_url, new_url=new_url,
+                reset_redirects=True, is_input_cycle=True,
             )
         if 30 <= code < 40:
             redirect_url = resolve_url(current_url, meta.strip())
@@ -2088,18 +2866,11 @@ class Browser:
     # ── Main Fetch Loop ─────────────────────────────────────────────────────
 
     def _fetch(self, url: str, data: bytes = b"", push_history: bool = True) -> None:
-        """Iteratively fetch+render a URL, handling redirects and input.
-
-        The `current_data` for a request is always taken from either the
-        initial `data` parameter or from a HandlerResult.data emitted by
-        the previous iteration's response handler. Each iteration resets
-        `current_data` to b"" by default; handlers that need to send a
-        body (e.g. Spartan code 5 input) must explicitly populate
-        HandlerResult.data.
-        """
+        """Iteratively fetch+render a URL, handling redirects and input."""
         current_url = url
         current_data = data
         redirect_depth = 0
+        input_cycles = 0
         visited: set[str] = set()
 
         while True:
@@ -2113,9 +2884,16 @@ class Browser:
                 print(bright_red(f"  ✗  Too many redirects (>{max_redirects}), aborting.\n"))
                 return
 
-            # Visited-set guard: only apply when there is no request body.
-            # A POST-like request with data is meaningfully different from
-            # a previous GET-like fetch of the same URL, so allow it.
+            # Independent ceiling on interactive input cycles. Input responses
+            # reset the redirect counter (so a legitimate form can submit and
+            # then be redirected freely), so without this a hostile server
+            # could trap the user in an endless prompt loop (issue #1).
+            if input_cycles > _MAX_INPUT_CYCLES:
+                print(bright_red(
+                    f"  ✗  Too many input cycles (>{_MAX_INPUT_CYCLES}), aborting.\n"
+                ))
+                return
+
             if not current_data and current_url in visited:
                 print(bright_red(f"  ✗  Redirect loop detected for {current_url}\n"))
                 return
@@ -2128,8 +2906,6 @@ class Browser:
                 print(f"\r{bright_red(f'  ✗  Error: {exc}')}{_clear_eol()}")
                 return
 
-            # Status echo — use ANSI 'erase to end of line' to scrub any
-            # leftover characters from the longer "⟳ <url>" line above.
             print(f"\r{dim(f'  {code}  {meta[:60]}')}{_clear_eol()}")
 
             handler = self._response_handlers.get(scheme)
@@ -2149,11 +2925,16 @@ class Browser:
             else:
                 return
 
-            # Carry request body forward only if the handler set it;
-            # otherwise the next request is a plain GET-like fetch.
             current_data = result.data
 
-            if result.reset_redirects:
+            if result.is_input_cycle:
+                # Count input cycles independently and reset the redirect
+                # counter / visited set so a fresh form submission isn't
+                # falsely flagged as a redirect loop.
+                input_cycles += 1
+                redirect_depth = 0
+                visited.clear()
+            elif result.reset_redirects:
                 redirect_depth = 0
                 visited.clear()
             else:
@@ -2168,11 +2949,16 @@ class Browser:
             if not self.history or self.history[-1] != url:
                 self.history.append(url)
                 self._increment_history_counter()
+            # Bound in-memory history growth during a long session; on-disk
+            # saving already slices to the limit, but the live list could
+            # otherwise grow without bound (issue #5).
+            self._truncate_history_in_memory(self.config.history_limit)
             self.hist_pos = len(self.history) - 1
 
         self.current_url = url
         self.last_body = body
         self.last_mime = mime
+        self.current_is_feed = False
         self._render(body, mime, url)
 
     def _render(self, body: bytes, mime: str, url: str) -> None:
@@ -2204,6 +2990,13 @@ class Browser:
             if not parts.path or parts.path.endswith("/"):
                 mime = "text/gemini"
 
+        # Feed detection (RSS / Atom / RDF). Render recognised feeds as
+        # gemtext so they inherit link numbering, find, save, and pager.
+        if looks_like_feed(body, mime):
+            if self._render_feed(body, url):
+                return
+            # Parsing failed — fall through to normal rendering.
+
         text: Optional[str]
         try:
             text = body.decode("utf-8", errors="replace")
@@ -2231,6 +3024,40 @@ class Browser:
             ))
         print()
 
+    def _render_feed(self, body: bytes, url: str) -> bool:
+        """Render a feed as gemtext. Returns True on success, False to let
+        the caller fall back to normal rendering."""
+        try:
+            feed = parse_feed(body)
+        except ValueError as exc:
+            print(yellow(f"  ⚠  Could not parse feed ({exc}); showing raw document."))
+            return False
+        if feed is None:
+            return False
+
+        gemtext = feed_to_gemtext(feed, url, summaries=not self.feed_compact)
+        lines, links = render_gemtext(gemtext, url)
+        self.current_links = links
+        self.current_render_lines = lines
+        self.current_is_feed = True
+
+        self._emit_lines(lines)
+        print()
+        print(hr())
+
+        subscribed = url in self.subscriptions
+        sub_hint = (
+            "already subscribed — use 'check' for new entries"
+            if subscribed
+            else "use 'subscribe' to follow this feed"
+        )
+        print(dim(
+            f"\n  Feed: {len(feed.entries)} entries, "
+            f"{len(self.current_links)} link(s) — "
+            f"type a number to open. {sub_hint}.\n"
+        ))
+        return True
+
     def _render_gopher(self, body: bytes, url: str) -> None:
         if is_gopher_menu(body):
             try:
@@ -2242,6 +3069,14 @@ class Browser:
                 lines = render_plain(body.decode("utf-8", errors="replace"))
                 self.current_links = []
         else:
+            # A Gopher text file could still be a feed (type 0 .xml selector),
+            # but Gopher hands us no MIME, so we require a *strong* feed signal
+            # — an actual feed root element at the start of the document —
+            # rather than a loose substring match, so a plain text file that
+            # merely mentions "<feed>" isn't hijacked (issue #3).
+            if looks_like_feed(body, "", require_strong=True):
+                if self._render_feed(body, url):
+                    return
             try:
                 text = body.decode("utf-8", errors="replace")
                 lines = render_plain(text)
@@ -2272,10 +3107,7 @@ class Browser:
         self.current_render_lines = []
         self.current_links = []
         print(yellow(f"  Binary content ({mime or 'unknown'}), {len(body):,} bytes"))
-        fname = os.path.basename(url.rstrip("/").split("/")[-1] or "download")
-        # Don't let a server suggest a hidden/dotfile name (e.g. ".bashrc").
-        if not fname or fname.startswith("."):
-            fname = "download"
+        fname = _safe_filename_from_url(url, default="download")
         if self._confirm(f"  Save as [{fname}]? [y/N]: "):
             if Path(fname).exists() and not self._confirm(f"  {fname} exists. Overwrite? [y/N]: "):
                 print(dim("  Cancelled."))
@@ -2302,7 +3134,8 @@ class Browser:
                 )
             hist = dim(f"[{self.hist_pos + 1}/{len(self.history)}]")
             scheme_display = green(scheme) if scheme == "keplers" else cyan(scheme)
-            return f"{scheme_display}:{bright_cyan(display)} {hist} {bright_cyan('❯')} "
+            feed_marker = bright_green(" ⊚") if self.current_is_feed else ""
+            return f"{scheme_display}:{bright_cyan(display)}{feed_marker} {hist} {bright_cyan('❯')} "
         return f"{bright_cyan('browser')} {bright_cyan('❯')} "
 
 
@@ -2316,21 +3149,50 @@ BANNER = r"""
   ║    ██╔══██╗██╔══██║██╔══██╗██╔══╝  ██║      gopher   ║
   ║    ██████╔╝██║  ██║██████╔╝███████╗███████╗  nex     ║
   ║    ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝  spartan ║
-  ║                                              finger  ║
+  ║                                       finger · feeds ║
   ║  multi-protocol browser — type help or ? to start    ║
   ╚══════════════════════════════════════════════════════╝
 """
 
+# Map a bare-hostname's resolved default scheme. We derive the default
+# scheme from the user's configured home page rather than hard-coding
+# spartan, so typing a bare hostname is consistent with the user's
+# preferred protocol (issue #12).
+_VALID_BARE_SCHEMES = (
+    "kepler", "keplers", "spartan", "gemini", "nex", "gopher",
+)
+_DEFAULT_BARE_SCHEME = "spartan"
 
-def normalise_url(raw: str) -> str:
-    """Add a default scheme if the input has none."""
+
+def _default_bare_scheme(home: Optional[str] = None) -> str:
+    """Pick the scheme to apply to a bare hostname.
+
+    Honours the configured home page's scheme when it is a network scheme
+    we can reasonably default to; otherwise falls back to spartan.
+    """
+    if home:
+        scheme = urlparse(home).scheme
+        if scheme in _VALID_BARE_SCHEMES:
+            return scheme
+    return _DEFAULT_BARE_SCHEME
+
+
+def normalise_url(raw: str, *, default_scheme: Optional[str] = None) -> str:
+    """Add a default scheme if the input has none.
+
+    A bare hostname (no scheme) is mapped to `default_scheme` (which the
+    caller derives from the configured home page — issue #12). When the
+    caller passes nothing, we fall back to the module default so this
+    function remains usable standalone.
+    """
     if "://" in raw:
         return raw
     if "@" in raw:
         user, _, host = raw.partition("@")
         return f"finger://{host}/{user}"
     if raw == "localhost" or ":" in raw or "." in raw:
-        return "spartan://" + raw
+        scheme = default_scheme or _DEFAULT_BARE_SCHEME
+        return f"{scheme}://" + raw
     raise ValueError("Ambiguous input: use full URL or user@host for finger")
 
 
@@ -2339,12 +3201,17 @@ def normalise_url(raw: str) -> str:
 def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None]]:
     """Build the REPL command dispatch table."""
 
+    def _norm(raw: str) -> str:
+        # Thread the home-derived default scheme through every normalise call
+        # made from the REPL so bare hostnames honour the user's preference.
+        return normalise_url(raw, default_scheme=_default_bare_scheme(browser.HOME))
+
     def cmd_go(arg, arg2):
         if not arg:
             print(yellow("  Usage: go <url>"))
             return
         try:
-            browser.navigate(normalise_url(arg))
+            browser.navigate(_norm(arg))
         except ValueError as e:
             print(yellow(f"  {e}"))
 
@@ -2370,7 +3237,7 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
     def cmd_set(arg, arg2):
         if not arg or not arg2:
             print(yellow("  Usage: set <option> <value>"))
-            print(dim("  Options: pager, color, home, timeout, history_limit"))
+            print(dim("  Options: pager, color, feed_compact, home, timeout, history_limit"))
         else:
             browser.set_option(arg, arg2)
 
@@ -2379,6 +3246,15 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
             browser.bookmark_picker()
         else:
             browser.bookmark_open(arg)
+
+    def cmd_subscribe(arg, arg2):
+        browser.subscribe(arg)
+
+    def cmd_unsubscribe(arg, arg2):
+        if not arg:
+            print(yellow("  Usage: unsubscribe <n|url>"))
+        else:
+            browser.unsubscribe(arg)
 
     table: dict[str, Callable[[str, str], None]] = {}
 
@@ -2406,32 +3282,33 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
     register(("bookmarks", "bms", "marks"), lambda a, b: browser.bookmark_picker())
     register(("open", "ob"), cmd_open)
     register(("delbm", "rmbm"), cmd_delbm)
+    register(("subscribe", "sub"), cmd_subscribe)
+    register(("unsubscribe", "unsub"), cmd_unsubscribe)
+    register(("subscriptions", "subs", "feeds"), lambda a, b: browser.show_subscriptions())
+    register(("check",), lambda a, b: browser.check_feeds())
     register(("set",), cmd_set)
     register(("clear",), lambda a, b: clear_screen())
 
     return table
 
 
-def run_repl(config: Config, start_url: Optional[str] = None) -> None:
-    """Run the interactive REPL with an already-resolved Config.
-
-    The caller is responsible for constructing the Config (loading from
-    disk + applying any CLI overrides). We do NOT reload from disk here,
-    so per-invocation CLI flags are honoured without being persisted.
-    """
-    # set_use_color is also called by Browser.__init__, but we set it here too
-    # so any pre-navigation output (banner, errors) honours --no-color.
+def run_repl(start_url: Optional[str] = None) -> None:
+    """Run the interactive REPL."""
+    config = _load_config()
     set_use_color(config.color)
 
     browser = Browser(config)
     commands = _make_command_table(browser)
     quit_cmds = {"quit", "q", "exit", "bye"}
 
+    def _norm(raw: str) -> str:
+        return normalise_url(raw, default_scheme=_default_bare_scheme(browser.HOME))
+
     print(bright_cyan(BANNER))
 
     if start_url:
         try:
-            browser.navigate(normalise_url(start_url))
+            browser.navigate(_norm(start_url))
         except ValueError as e:
             print(yellow(f"  {e}"))
 
@@ -2468,7 +3345,7 @@ def run_repl(config: Config, start_url: Optional[str] = None) -> None:
             handler(arg, arg2)
         else:
             try:
-                browser.navigate(normalise_url(raw))
+                browser.navigate(_norm(raw))
             except ValueError as e:
                 print(yellow(f"  {e}"))
 
@@ -2482,17 +3359,15 @@ def main() -> None:
         "url", nargs="?",
         help="URL to open on start (kepler://, keplers://, spartan://, gemini://, nex://, gopher://, finger://)",
     )
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colours (this session only)")
-    parser.add_argument("--pager", action="store_true", help="Enable pager mode (this session only)")
-    parser.add_argument("--home", type=str, help="Set home URL (this session only)")
-    parser.add_argument("--timeout", type=int, help="Set connection timeout (this session only)")
-    parser.add_argument("--history-limit", type=int, help="Set max history entries (this session only)")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colours")
+    parser.add_argument("--pager", action="store_true", help="Enable pager mode")
+    parser.add_argument("--home", type=str, help="Set home URL (overrides config)")
+    parser.add_argument("--timeout", type=int, help="Set connection timeout (overrides config)")
+    parser.add_argument("--history-limit", type=int, help="Set max history entries (overrides config)")
+    parser.add_argument("--check-feeds", action="store_true",
+                        help="Check subscribed feeds for new entries and exit")
 
     args = parser.parse_args()
-
-    # Load persisted config, then layer CLI overrides on top *in memory only*.
-    # CLI flags are per-invocation and MUST NOT be written back to config.json;
-    # only the interactive `set` command persists changes.
     config = _load_config()
 
     if args.no_color:
@@ -2516,13 +3391,20 @@ def main() -> None:
         else:
             print(yellow("  Warning: --history-limit must be non-negative."))
 
-    # Ensure a config file exists on first run, but persist only the on-disk
-    # defaults — never the transient CLI overrides applied above.
-    if not _CONFIG_FILE.exists():
-        _save_config(_load_config())  # writes defaults (or whatever is valid on disk)
+    _save_config(config)
+
+    # Non-interactive feed check mode (e.g. for cron).
+    if args.check_feeds:
+        set_use_color(config.color)
+        browser = Browser(config)
+        try:
+            browser.check_feeds()
+        finally:
+            browser.close()
+        return
 
     try:
-        run_repl(config, args.url)
+        run_repl(args.url)
     except KeyboardInterrupt:
         print()
 
