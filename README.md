@@ -8,18 +8,19 @@
 ║    ██╔══██╗██╔══██║██╔══██╗██╔══╝  ██║      gopher      ║
 ║    ██████╔╝██║  ██║██████╔╝███████╗███████╗  nex.      ║
 ║    ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝  spartan.  ║
-║                                                     finger    ║
+║                                            finger · feeds   ║
 ║  multi-protocol browser — type help or ? to start.             ║
 ╚══════════════════════════════════════════════════════╝ *I hate trying to align these things!*
 ```
 
 
-### *One terminal. Seven protocols. Zero dependencies. No JavaScript. No ads. No tracking. No corporate dashboards screaming for your attention.*
+### *One terminal. Seven protocols. A built-in feed reader. Zero dependencies. No JavaScript. No ads. No tracking. No corporate dashboards screaming for your attention.*
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Pure stdlib](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](https://docs.python.org/3/library/)
 [![Single file](https://img.shields.io/badge/distribution-one_file-orange.svg)](#-installation)
 [![Protocols](https://img.shields.io/badge/protocols-7-purple.svg)](#-supported-protocols)
+[![Feeds](https://img.shields.io/badge/feeds-RSS_·_Atom-ff8800.svg)](#-feeds-rss--atom)
 [![Finger](https://img.shields.io/badge/finger-RFC_1288-8a2be2.svg)](https://datatracker.ietf.org/doc/html/rfc1288)
 [![Gemini](https://img.shields.io/badge/gemini-protocol-00bfa5.svg)](https://geminiprotocol.net/)
 [![Gopher](https://img.shields.io/badge/gopher-RFC_1436-ffb300.svg)](https://datatracker.ietf.org/doc/html/rfc1436)
@@ -40,6 +41,8 @@ You know the ones. Hand-rolled gemtext capsules. Gopherholes with ASCII art that
 
 That's the **smolnet** — sometimes "smallnet", always weird in the good way — and babelTUI speaks **seven** of its dialects from a single Python file you can drop on any machine and run.
 
+And because half the smolnet *publishes* via Atom and RSS anyway, babelTUI now reads those too — point it at a feed and it renders as a clean, navigable page; `subscribe` to it and it tracks what's new.
+
 No npm. No virtualenv. No Electron. No 400MB of `node_modules`. Just `python babeltui.py` and you're in.
 
 ---
@@ -49,16 +52,17 @@ No npm. No virtualenv. No Electron. No 400MB of `node_modules`. Just `python bab
 Because the existing browser landscape looks like this:
 
 - **The Big Web™** — 200 trackers, six cookie banners, and a popup begging you to install an app, all to read 400 words.
-- **Smolnet clients** — great, but now you've got `amfora` for Gemini, `lagrange` for Gemini-but-prettier, `bombadillo` for Gopher, a separate finger client, *and kepler this is the first project outside the protocol author's [[Caztor](https://github.com/kevinboone/caztor)] browser*
-- **babelTUI** — speaks `kepler://`, `keplers://`, `gemini://`, `spartan://`, `nex://`, `gopher://`, and `finger://` from one prompt. Click a Gopher menu item that points to a Gemini capsule and it just *works*.
+- **Smolnet clients** — great, but now you've got `amfora` for Gemini, `lagrange` for Gemini-but-prettier, `bombadillo` for Gopher, a separate finger client, a separate feed reader, *and kepler this is the first project outside the protocol author's [[Caztor](https://github.com/kevinboone/caztor)] browser*
+- **babelTUI** — speaks `kepler://`, `keplers://`, `gemini://`, `spartan://`, `nex://`, `gopher://`, and `finger://` from one prompt, *and* reads RSS/Atom feeds inline. Click a Gopher menu item that points to a Gemini capsule and it just *works*.
 
-### The pitch in five bullets
+### The pitch in seven bullets
 
-- 🪶 **Featherweight** — single Python file, no dependencies, runs anywhere Python 3.10 does *I successfully run it on  my sdf.org account and they run Python 3.9.19!*
+- 🪶 **Featherweight** — single Python file, no dependencies, runs anywhere Python 3.10 does *I successfully run it on my sdf.org account and they run Python 3.9.19!*
 - 🔐 **TOFU pinning** — Trust-On-First-Use certificate verification, the way smolnet does TLS
 - 🎨 **Pretty gemtext** — semantic ANSI colour, proper headings, bullet lists, framed code blocks
 - 🧭 **Real navigation** — back/forward history, bookmarks, in-page search, link-by-number
-- ⌨️ **Tab completion** — for commands, bookmarks, *and* recent URLs
+- 📰 **Feed reader built in** — RSS 2.0, RSS 1.0 (RDF) and Atom, with subscriptions and new-entry checking
+- ⌨️ **Tab completion** — for commands, bookmarks, recent URLs, *and* feed subscriptions
 - 🦊 **Cross-protocol linking** — Gopher menus get auto-rewritten to gemtext; everything just composes
 
 ---
@@ -77,6 +81,8 @@ Because the existing browser landscape looks like this:
 
 `gopher-search://` is a synthetic scheme used internally for Gopher type-7 search items. `telnet://` links in Gopher menus are rendered (and labelled) but won't launch a session — that's your job.
 
+> Not a transport, but a first-class capability: **RSS / Atom / RSS 1.0 feeds** are auto-detected over *any* of these protocols and rendered inline. See [📰 Feeds](#-feeds-rss--atom).
+
 ### 🛰️ A word on Kepler
 
 [Kepler](https://github.com/kevinboone/kepler-protocol) is a **brand new** smolnet protocol — version 0.1c was published in May 2026 by Kevin Boone. It's derived from Gemini but fixes three things that were always going to hurt Gemini at scale:
@@ -85,7 +91,7 @@ Because the existing browser landscape looks like this:
 - **Optional plaintext.** Gemini mandates TLS, which locks out retro-computing folks (try doing TLS on a 6502). Kepler offers both `kepler://` (plain) and `keplers://` (TLS), so a Z80 in your loft can serve a capsule too.
 - **Language tags.** Clients send the user's preferred language with every request, so servers can return localised content without User-Agent sniffing or query-string hacks.
 
-babelTUI implements Kepler 0.1c per spec, including the full status code table (1x input, 2x success with optional metadata triple, 3x redirect, 4x temporary failure, 5x permanent failure, 6x client cert, 7x unchanged), the language tag from `$LANG` per §8.1.2, and the §4.7.1 plaintext-downgrade warnings when following a link from a `keplers://` page to a `kepler://` one.
+babelTUI implements Kepler 0.1c per spec, including the full status code table (1x input, 2x success with optional metadata triple, 3x redirect, 4x temporary failure, 5x permanent failure, 6x client cert, 7x unchanged), the language tag from `$LANG` per §8.1.2 (honouring `LC_ALL` / `LC_MESSAGES` precedence), and the §4.7.1 plaintext-downgrade warnings when following a link from a `keplers://` page to a `kepler://` one.
 
 Live test capsules from the spec author:
 
@@ -93,6 +99,71 @@ Live test capsules from the spec author:
 - `keplers://larsthebear.me/` — TLS
 
 Point babelTUI at either and you're talking Kepler. The bones of a scalable smolnet, in a protocol you can implement in an afternoon.
+
+---
+
+## 📰 Feeds (RSS / Atom)
+
+A huge chunk of the smolnet — and the wider indie web — still syndicates via
+RSS and Atom. babelTUI now speaks all three common dialects with **zero extra
+dependencies** (no `feedparser`, just stdlib `xml.etree`):
+
+- **RSS 2.0** (the common case)
+- **RSS 1.0 / RDF** (the old purl.org namespace)
+- **Atom** (RFC 4287)
+
+### How it works
+
+Feeds are **auto-detected**. Open any URL that turns out to be a feed — over
+`gemini://`, `spartan://`, `kepler://`, `gopher://`, whatever — and babelTUI
+renders it as a clean gemtext-style page: feed title, per-entry headings, dates,
+summaries, and numbered links you can follow like any other page. A `⊚` marker
+appears in the prompt so you know you're looking at a feed.
+
+Detection is conservative: a generic `application/xml` body only renders as a
+feed if it actually sniffs as one, and over Gopher (which sends no MIME type) we
+require a genuine feed *root element* — a plain text file that merely mentions
+`<feed>` won't get hijacked.
+
+### Subscriptions
+
+```text
+subscribe [url]        # subscribe to a feed (or the current page if it's a feed)
+unsubscribe <n|url>    # remove a subscription by number or URL
+subscriptions / subs   # interactive subscription picker (alias: feeds)
+check                  # re-fetch every feed and report what's new
+```
+
+When you `subscribe`, babelTUI records every entry it already sees as "seen",
+so the first `check` only reports *genuinely new* items. Run `check` and it
+fetches every subscription, shows a per-feed `N new` / `up to date` line, then
+renders all the new entries as one aggregated, numbered "river" you can open
+straight from. Unread counts are remembered, so the `●N new` badge shows up in
+the subscription picker even after you've moved on.
+
+### Non-interactive checking (cron-friendly)
+
+```bash
+babeltui --check-feeds
+```
+
+Checks every subscription, prints what's new, and exits — perfect for a cron
+job or a login-shell one-liner.
+
+### Compact mode
+
+```text
+set feed_compact on    # hide per-entry summaries (titles + links + dates only)
+set feed_compact off   # show summaries (default)
+```
+
+### Security
+
+XML is untrusted input, so feeds are parsed defensively: response bodies are
+size-capped before parsing, and any document carrying a `<!DOCTYPE>` declaration
+is **refused outright** (closing the entity-expansion / "billion laughs" / XXE
+vector). For belt-and-braces hardening you could swap in `defusedxml`, but the
+stdlib path is locked down for the smolnet threat model.
 
 ---
 
@@ -141,6 +212,9 @@ No `pip install`. No virtualenv. No `requirements.txt`. The dependency section o
 
 # Pager mode for the long-form posts
 ./babeltui.py --pager
+
+# Check all your subscribed feeds for new entries, then exit
+./babeltui.py --check-feeds
 ```
 
 Inside, type `help` or `?` to see everything. Or just start poking — `go`, `back`, `bookmark`, and numbers-to-follow-links cover 90% of browsing.
@@ -184,10 +258,19 @@ That's it. That's the browser.
 <details open>
 <summary><b>🔐 TOFU certificate pinning</b></summary>
 
-The smolnet doesn't play the Public CA game. Capsules are self-signed and proud of it. babelTUI pins SHA-256 fingerprints on first contact and screams in bright red if they ever change without your say-so.
+The smolnet doesn't play the Public CA game. Capsules are self-signed and proud
+of it. babelTUI pins SHA-256 fingerprints **per `host:port`** on first contact —
+so a Gemini service and a Keplers service on the same hostname are pinned
+independently — and prints a notice when it does so:
 
 ```
-⚠  WARNING: Certificate fingerprint mismatch for example.org!
+🔑  Pinned new certificate for example.org:1965 (sha256:5f3a91b2c4d6e8f0…)
+```
+
+It then screams in bright red if a fingerprint ever changes without your say-so:
+
+```
+⚠  WARNING: Certificate fingerprint mismatch for example.org:1965!
 Expected: 5f3a...
 Actual:   91b2...
 Accept new certificate? [y/N]:
@@ -210,6 +293,29 @@ Per §4.7.1, following a link from `keplers://` to `kepler://` requires explicit
 A Gopher menu that links to a Gemini capsule? Click the number. Done. A gemtext page linking to a finger query? Same. A Kepler capsule with a `nex://` link to a Nex server? Yes, even that.
 
 The seven protocols share one address bar, one history, one bookmark store. You don't switch tools to switch nets.
+</details>
+
+<details>
+<summary><b>📰 Built-in RSS / Atom feed reader</b></summary>
+
+RSS 2.0, RSS 1.0 (RDF) and Atom, all auto-detected and rendered as navigable
+gemtext — no `feedparser`, no extra install. Open a feed and read it like any
+page; `subscribe` to track it; `check` to see what's new across everything you
+follow. New entries are aggregated into one numbered river you can open straight
+from. A `⊚` in the prompt tells you the current page is a feed.
+
+DOCTYPE declarations are rejected and bodies are size-capped, so a hostile feed
+can't XML-bomb you.
+</details>
+
+<details>
+<summary><b>🗞️ Subscription tracking with unread badges</b></summary>
+
+`subscriptions` (a.k.a. `subs`/`feeds`) opens a full-screen picker like history
+and bookmarks, complete with `●N new` badges that survive across a
+`check` → `subs` sequence. `babeltui --check-feeds` runs the whole sweep
+non-interactively — drop it in a cron job and let it tell you when your capsules
+post.
 </details>
 
 <details>
@@ -241,13 +347,13 @@ PDF? Image? Tarball? babelTUI notices, tells you the size, asks if you want to s
 <details>
 <summary><b>🛡️ Atomic, permission-hardened state</b></summary>
 
-Bookmarks, history, known hosts, config — all written to `~/.config/babeltui/` with `chmod 0600` and via write-then-rename so an interrupted save can never corrupt your data. Yank the power cord mid-bookmark. Try us.
+Bookmarks, history, known hosts, config, feed subscriptions — all written to `~/.config/babeltui/` with `chmod 0600` and via write-then-rename so an interrupted save can never corrupt your data. A failed write even cleans up its own temp file. Yank the power cord mid-bookmark. Try us.
 </details>
 
 <details>
 <summary><b>⌨️ Context-aware tab completion</b></summary>
 
-Tab after `go`? Completes against your bookmarks and recent history. Tab after `delbm`? Completes against bookmark names only. Tab on an empty line? Lists commands. The completer knows what you're up to.
+Tab after `go`? Completes against your bookmarks and recent history. Tab after `delbm`? Completes against bookmark names only. Tab after `unsubscribe`? Completes against your feed subscriptions. Tab on an empty line? Lists commands. The completer knows what you're up to.
 </details>
 
 ---
@@ -288,10 +394,19 @@ delh <n>            # delete single history entry
 clearhistory        # purge all history (with confirmation)
 ```
 
+### Feeds
+```text
+subscribe [url]        # subscribe to a feed (or current page if it's a feed)
+unsubscribe <n|url>    # remove subscription by index or URL
+subscriptions / subs   # interactive subscription picker (alias: feeds)
+check                  # check all feeds for new entries
+```
+
 ### Settings
 ```text
 set pager on|off
 set color on|off
+set feed_compact on|off
 set home <url>
 set timeout <seconds>
 set history_limit <n>
@@ -312,15 +427,18 @@ Configuration lives at `~/.config/babeltui/config.json`. Defaults:
 
 ```json
 {
-"home": "spartan://mozz.us/",
-"timeout": 15,
-"history_limit": 500,
-"color": true,
-"pager": false
+  "home": "spartan://mozz.us/",
+  "timeout": 15,
+  "history_limit": 500,
+  "color": true,
+  "pager": false,
+  "feed_compact": false
 }
 ```
 
-Edit by hand or use `set <option> <value>` in the REPL — either way works. CLI flags (`--home`, `--timeout`, `--no-color`, `--pager`, `--history-limit`) override and persist.
+Edit by hand or use `set <option> <value>` in the REPL — either way works. CLI flags (`--home`, `--timeout`, `--no-color`, `--pager`, `--history-limit`) override and persist. `--check-feeds` runs a one-shot feed sweep and exits.
+
+> **Bare hostnames** (typing `example.com` with no scheme) default to the scheme of your configured **home page** — so if your home is a `gemini://` capsule, a bare hostname goes to Gemini, not Spartan. Use a full URL to force any other scheme.
 
 Want all your shell sessions to start in your favourite capsule?
 
@@ -334,12 +452,14 @@ alias smol='babeltui keplers://larsthebear.me/'
 
 This is a smolnet client, so the threat model is appropriately smolnet:
 
-- **TLS** is verified by **TOFU fingerprint pin**, not the CA system. First contact records the SHA-256; mismatches need explicit confirmation. CA chain validation is intentionally off because self-signed is the norm out here.
-- **Plaintext downgrades** (`keplers://` → `kepler://`) require confirmation. Per Kepler spec §4.7.1.
+- **TLS** is verified by **TOFU fingerprint pin**, keyed on **`host:port`** (not bare host), so distinct services on the same hostname are pinned independently. First contact records the SHA-256 *and prints a notice*; mismatches need explicit confirmation. CA chain validation is intentionally off because self-signed is the norm out here. **Note:** certificate *expiry* is not checked — an expired-but-unchanged cert is accepted silently, matching smolnet convention.
+- **Plaintext downgrades** (`keplers://` → `kepler://`) require confirmation, both on redirects and when following links. Per Kepler spec §4.7.1.
 - **Sensitive input** (Kepler code 11) uses `getpass` — no echo, no readline history, no shell history.
-- **State files** are written with `0600` permissions on every save, atomically.
-- **URI lengths** are bounded per spec (1024 bytes for Kepler and Gemini); headers are bounded defensively.
-- **Redirect loops** are caught (10 hops general, 5 for Kepler).
+- **State files** are written with `0600` permissions on every save, atomically; a failed write cleans up its own temp file rather than leaving debris.
+- **Untrusted XML** (feeds) is hardened: bodies are size-capped, and any `<!DOCTYPE>` is rejected outright to block entity-expansion / XXE attacks.
+- **Request-line injection** is prevented: CR/LF is stripped from user-supplied Gopher selectors/queries and finger users before they hit the wire.
+- **URI lengths** are bounded per spec (1024 bytes for Kepler and Gemini); headers and response bodies are bounded defensively (50 MiB body cap).
+- **Redirect loops** are caught (10 hops general, 5 for Kepler), and **interactive input cycles** have their own independent ceiling so a server can't trap you in an endless prompt loop.
 
 Read the source. It's one file. You can audit the entire thing in an afternoon.
 
@@ -363,7 +483,7 @@ That's the whole repo. *That's the point.*
 
 Patches welcome, with a few non-negotiables to keep this thing what it is:
 
-- 🚫 **No runtime dependencies outside the standard library.** If your patch needs `requests` or `rich`, it's a different project.
+- 🚫 **No runtime dependencies outside the standard library.** If your patch needs `requests` or `rich` — or `feedparser` — it's a different project.
 - 🚫 **No splitting into a package.** The single-file property is a feature.
 - ✅ **Match the existing style** — PEP 8, type hints, dataclasses where they fit, named constants.
 - ✅ **Defensive error handling** — no bare `except`, catch the narrowest exception that makes sense.
@@ -396,13 +516,17 @@ Include:
 - **Nex** — `nex://nex.nightfall.city/`
 - **Gopher** — RFC 1436, plus `gopher://gopher.floodgap.com/` for the living scene
 - **Finger** — RFC 1288
+- **Atom** — RFC 4287; **RSS 2.0** — [rssboard.org/rss-specification](https://www.rssboard.org/rss-specification)
 
 ### Live capsules to try
 
 - `keplers://larsthebear.me/` — the reference Kepler server
 - `gemini://geminiprotocol.net/` — the Gemini mothership
 - `spartan://mozz.us/` — default home, lovely board
-- `gopher://gopher.floodgap.com/` — the OG -Gopher
+- `gopher://gopher.floodgap.com/` — the OG Gopher
+
+> **Tip:** point babelTUI at any Atom/RSS feed URL (e.g. a Gemini capsule's
+> `atom.xml` or `feed.xml`) and it'll render and let you `subscribe`.
 
 You can browse all of these *from babelTUI itself*. That feels right, doesn't it.
 
@@ -426,7 +550,7 @@ This whole thing was coded, documented and testing was done on my Samsung Galaxy
 
 Special thanks to **Kevin Boone** for designing the Kepler protocol and putting the spec into the public domain (CC0). Building a client for a protocol whose author explicitly *invites* implementations is a rare joy — every ambiguity has an answer in the spec, every design decision has a rationale in the explanatory notes.
 
-To everyone who keeps a capsule lit, who maintains a Gopher server "just because", who answers their finger queries with `.plan` files like it's still the nineties — this is for you.
+To everyone who keeps a capsule lit, who maintains a Gopher server "just because", who answers their finger queries with `.plan` files like it's still the nineties, who still publishes an honest little RSS feed instead of a newsletter funnel — this is for you.
 
 The smolnet isn't a nostalgia project. It's a *current*, *evolving* working alternative to a web that lost the plot. Kepler launching in 2026 with first-class caching support is proof: this corner of the net is still building. babelTUI is just one more way in.
 
@@ -446,6 +570,6 @@ Kepler protocol specification © Kevin Boone, released under [CC0 1.0](https://c
 </p>
 
 <p align="center">
-⌨️ 🌐 📜
+⌨️ 🌐 📰 📜
 </p>
-
+```
