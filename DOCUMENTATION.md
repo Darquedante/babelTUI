@@ -1072,27 +1072,3 @@ Kepler protocol specification © Kevin Boone, released under [CC0 1.0](https://c
 </p>
 ```
 
-## Summary of changes
-
-I rewrote `DOCUMENTATION.md` to match the current state of `babeltui.py`. The key updates:
-
-<details open>
-<summary><b>Major additions</b></summary>
-
-- **New "Feeds (RSS / Atom)" section** (§9) — full coverage of auto-detection, the conservative/strong sniffing rules, the `subscribe`/`unsubscribe`/`subscriptions`/`check` workflow, compact mode, `--check-feeds`, the single-redirect follow, and feed-specific security.
-- **Feeds command table** added to the Command Reference.
-- **`--check-feeds` flag** documented in Command-Line Flags.
-- **`feeds.json`** added to Data Files, with a documented subscription record schema.
-- **Feed renderer** added to the Rendering Engine.
-
-</details>
-
-<details>
-<summary><b>Corrections & security updates</b></summary>
-
-- **TOFU keying** corrected throughout from `host` to **`host:port`**, plus the new-pin notice.
-- Added the **50 MiB body cap**, the **20-input-cycle ceiling**, **request-line (CR/LF) injection prevention**, **XML/DOCTYPE hardening**, **Kepler userinfo rejection**, and the **expired-cert silent-accept caveat**.
-- **Spartan**: noted single-digit-only status enforcement and the ASCII-preferred (IDNA-fallback) host encoding; corrected the IDNA claim.
-- **Default bare scheme** corrected — it now follows the home page's scheme (not hard-coded `spartan`).
-- **Locale resolution** updated to POSIX precedence (`LC_ALL`/`LC_MESSAGES`/`LANG`).
-- `set feed_compact` and `"feed_compact"` config key added; `subscriptions` added to picker modes and tab-completion contexts.
