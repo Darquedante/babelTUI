@@ -6,7 +6,26 @@ Views RSS 2.0 / RSS 1.0 / Atom feeds and manages feed subscriptions.
 
 Commands: go, back, forward, reload, up, finger, find, links, history,
           bookmark, bookmarks, source, clear, help, quit, save, set,
-          subscribe, unsubscribe, subscriptions, check
+          subscribe, unsubscribe, subscriptions, check, input
+
+Spartan input model
+-------------------
+Spartan has exactly FOUR status codes and NO input-required status code:
+
+    2  success
+    3  redirect
+    4  client error
+    5  server error
+
+Interactive input is driven entirely client-side by the `=:` content line,
+whose format is `=: <url> <prompt label>`. When the user selects such a
+prompt the client gathers text and uploads it as the *request body* of the
+next request to the target URL (NOT as a percent-encoded query string).
+
+A query string typed directly into a Spartan URL is supported as a
+convenience: it is percent-DECODED into raw body bytes before upload (so
+`?hello%20world` uploads the 11-byte string "hello world", not the literal
+"hello%20world").
 """
 from __future__ import annotations
 
@@ -85,9 +104,13 @@ mimetypes.init()
 DEFAULT_TIMEOUT = 15
 _MAX_REDIRECTS = 10
 _MAX_REDIRECTS_KEPLER = 5
-# Independent ceiling on interactive input cycles (1x / Spartan-5 / Gemini-1x).
+# Independent ceiling on interactive input cycles (Kepler-1x / Gemini-1x).
 # These reset the redirect counter, so without their own cap a hostile server
 # could trap the user in an unbounded prompt loop (issue #1).
+#
+# NOTE: Spartan has NO server-driven input cycle — its input is purely
+# client-side via the `=:` content line — so this ceiling applies only to
+# Kepler and Gemini.
 _MAX_INPUT_CYCLES = 20
 _HISTORY_LIMIT = 500
 _HISTORY_SAVE_INTERVAL = 10
@@ -301,6 +324,9 @@ def bright_yellow(t: str) -> str:
 def bright_blue(t: str) -> str:
     return _c(t, "94")
 
+def bright_magenta(t: str) -> str:
+    return _c(t, "95")
+
 def bright_cyan(t: str) -> str:
     return _c(t, "96")
 
@@ -361,6 +387,32 @@ def _strip_crlf(s: str) -> str:
     forge additional protocol lines (issue #7).
     """
     return s.replace("\r", "").replace("\n", "").replace("\x00", "")
+
+
+def _looks_like_text(body: bytes, sample: int = 4096) -> bool:
+    """Heuristic: is this body printable UTF-8 text rather than binary?
+
+    Used to rescue mislabelled bodies (e.g. an echo endpoint that returns
+    text as application/octet-stream) so we render them instead of offering
+    a file download. Conservative: any NUL byte, or a high proportion of
+    undecodable / control bytes, means 'binary'.
+    """
+    if not body:
+        return True  # empty body is trivially "text" (renders as nothing)
+    chunk = body[:sample]
+    if b"\x00" in chunk:
+        return False
+    try:
+        decoded = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    # Allow common whitespace controls; flag everything else in C0/C1.
+    allowed = {"\t", "\n", "\r", "\f", "\v"}
+    ctrl = sum(
+        1 for ch in decoded
+        if (ord(ch) < 0x20 or 0x7f <= ord(ch) < 0xa0) and ch not in allowed
+    )
+    return ctrl / len(decoded) < 0.05
 
 
 # ── Pager Support ───────────────────────────────────────────────────────────
@@ -720,7 +772,18 @@ def _parse_kepler_response(fp) -> tuple[int, str, bytes, dict]:
 
 
 def fetch_spartan(url: str, data: bytes, timeout: int) -> tuple[int, str, bytes]:
-    """Fetch a spartan:// URL."""
+    """Fetch a spartan:// URL.
+
+    `data` is the request body (upload). Per the Spartan model a non-empty
+    body is how interactive input (`=:` prompts) and form submissions are
+    delivered.
+
+    If no explicit body is supplied but the URL carries a query string, the
+    query is PERCENT-DECODED into raw body bytes and used as the body. This
+    mirrors the convenience behaviour of reference clients while ensuring
+    that e.g. `?hello%20world` uploads the 11-byte string "hello world"
+    rather than the literal 13-byte "hello%20world".
+    """
     parts = urlparse(url)
     if parts.scheme != "spartan":
         raise ValueError(f"Unsupported scheme: {parts.scheme!r}")
@@ -731,7 +794,10 @@ def fetch_spartan(url: str, data: bytes, timeout: int) -> tuple[int, str, bytes]
     query = parts.query
 
     if not data and query:
-        data = query.encode("utf-8")
+        # Decode the percent-encoded query into raw body bytes. The body is
+        # arbitrary data, not a URL component, so it must be unquoted before
+        # going on the wire (bug: previously sent verbatim with %XX intact).
+        data = unquote_to_bytes(query)
 
     encoded_host = _encode_host(host)
     encoded_path = quote_from_bytes(unquote_to_bytes(path)).encode("ascii")
@@ -1388,6 +1454,18 @@ SUPPORTED_SCHEMES = (
 )
 
 
+@dataclass
+class PromptLink:
+    """A Spartan `=:` input-prompt link.
+
+    The user supplies text which is uploaded as the *request body* of the
+    next request to `url` (NOT as a query string). `label` is the prompt
+    shown to the user.
+    """
+    label: str
+    url: str
+
+
 def _wrap_line(raw_line: str, w: int) -> list[str]:
     """Word-wrap a single line to width w, hard-breaking tokens longer than w."""
     wrapped = textwrap.wrap(
@@ -1401,24 +1479,79 @@ def _wrap_line(raw_line: str, w: int) -> list[str]:
     return wrapped or ["  "]
 
 
-def render_gemtext(text: str, base_url: str) -> tuple[list[str], list[tuple[str, str]]]:
-    """Parse gemtext into rendered lines and link list."""
-    output: list[str] = []
-    links: list[tuple[str, str]] = []
+@dataclass
+class RenderResult:
+    """Output of the gemtext renderer.
+
+    `links` are ordinary navigation links (`=>`). `prompts` are Spartan
+    `=:` input-prompt links. The two share a single user-facing numbering
+    space so a user can type a number to follow a link *or* answer a
+    prompt; `numbered` records, in order, which list each [n] refers to.
+    """
+    lines: list[str] = field(default_factory=list)
+    links: list[tuple[str, str]] = field(default_factory=list)
+    prompts: list[PromptLink] = field(default_factory=list)
+    # Sequence of ("link"|"prompt", index_into_that_list) in display order,
+    # so selection number N maps to numbered[N-1].
+    numbered: list[tuple[str, int]] = field(default_factory=list)
+
+
+def render_gemtext(text: str, base_url: str) -> RenderResult:
+    """Parse gemtext (with Spartan `=:` prompt support) into a RenderResult.
+
+    Link types handled:
+        =>  <url> [label]   ordinary navigation link
+        =:  <url> [label]   Spartan input-prompt link (body upload)
+
+    Both consume slots in a single shared numbering space so `open_link`
+    can dispatch a typed number to either a navigation or a prompt.
+    """
+    result = RenderResult()
     preformat = False
     w = term_width()
+
+    def _next_number() -> int:
+        return len(result.numbered) + 1
 
     for raw_line in text.splitlines():
         if raw_line.startswith("```"):
             preformat = not preformat
-            output.append(
+            result.lines.append(
                 dim("┌" + "─" * (w - 2) + "┐") if preformat
                 else dim("└" + "─" * (w - 2) + "┘")
             )
             continue
 
         if preformat:
-            output.append(dim("│ ") + raw_line)
+            result.lines.append(dim("│ ") + raw_line)
+            continue
+
+        # Spartan input-prompt line: `=: <url> [label]`
+        # Checked explicitly and early so it is never mistaken for body text
+        # or word-wrapped into oblivion (the original bug).
+        if raw_line.startswith("=:"):
+            rest = raw_line[2:].strip()
+            tokens = rest.split(None, 1)
+            if not tokens:
+                continue
+            raw_href = tokens[0]
+            label = tokens[1] if len(tokens) > 1 else raw_href
+            full_url = resolve_url(base_url, raw_href)
+            n = _next_number()
+            result.prompts.append(PromptLink(label=label, url=full_url))
+            result.numbered.append(("prompt", len(result.prompts) - 1))
+
+            # Spartan body-upload prompts only make sense for spartan:// URLs.
+            is_spartan = full_url.startswith("spartan://")
+            tag = bright_magenta(f"[{n}]")
+            marker = bright_magenta("✎") if is_spartan else yellow("✎?")
+            label_text = bright_magenta(label) if is_spartan else yellow(label)
+            result.lines.append(f"  {tag} {marker} {label_text}  {dim('(input)')}")
+            result.lines.append(f"       {dim(full_url)}")
+            if not is_spartan:
+                result.lines.append(
+                    f"       {dim('(non-Spartan target — input upload may not apply)')}"
+                )
             continue
 
         if raw_line.startswith("=>"):
@@ -1429,26 +1562,27 @@ def render_gemtext(text: str, base_url: str) -> tuple[list[str], list[tuple[str,
             raw_href = tokens[0]
             label = tokens[1] if len(tokens) > 1 else raw_href
             full_url = resolve_url(base_url, raw_href)
-            n = len(links) + 1
-            links.append((label, full_url))
+            n = _next_number()
+            result.links.append((label, full_url))
+            result.numbered.append(("link", len(result.links) - 1))
 
             is_supported = any(full_url.startswith(s) for s in SUPPORTED_SCHEMES)
             url_text = bright_blue(label) if is_supported else yellow(label)
-            output.append(f"  {bright_cyan(f'[{n}]')} {cyan('→')} {url_text}")
-            output.append(f"       {dim(full_url)}")
+            result.lines.append(f"  {bright_cyan(f'[{n}]')} {cyan('→')} {url_text}")
+            result.lines.append(f"       {dim(full_url)}")
             continue
 
         if raw_line.startswith("###"):
             h = raw_line[3:].strip()
-            output += ["", green(f"  ▸▸▸ {h}"), ""]
+            result.lines += ["", green(f"  ▸▸▸ {h}"), ""]
             continue
         if raw_line.startswith("##"):
             h = raw_line[2:].strip()
-            output += ["", bold(bright_green(f"  ▸▸ {h}")), ""]
+            result.lines += ["", bold(bright_green(f"  ▸▸ {h}")), ""]
             continue
         if raw_line.startswith("#"):
             h = raw_line[1:].strip()
-            output += [
+            result.lines += [
                 "",
                 bold(bright_yellow(f"  ▸ {h}")),
                 dim("  " + "═" * min(len(h) + 4, w - 4)),
@@ -1457,23 +1591,23 @@ def render_gemtext(text: str, base_url: str) -> tuple[list[str], list[tuple[str,
             continue
 
         if raw_line.startswith("* "):
-            output.append(f"  {cyan('•')} {raw_line[2:]}")
+            result.lines.append(f"  {cyan('•')} {raw_line[2:]}")
             continue
 
         if raw_line.startswith(">"):
-            output.append(f"  {dim('│')} {dim(raw_line[1:].strip())}")
+            result.lines.append(f"  {dim('│')} {dim(raw_line[1:].strip())}")
             continue
 
         if not raw_line:
-            output.append("")
+            result.lines.append("")
             continue
 
         if len(raw_line) > w - 4:
-            output.extend(_wrap_line(raw_line, w))
+            result.lines.extend(_wrap_line(raw_line, w))
         else:
-            output.append("  " + raw_line)
+            result.lines.append("  " + raw_line)
 
-    return output, links
+    return result
 
 
 def render_plain(text: str) -> list[str]:
@@ -1614,7 +1748,6 @@ def _interactive_picker(
 
     def draw() -> None:
         clear_screen()
-        w = term_width()
         viewport = max(3, term_height() - 8)
         half = viewport // 2
         v_start = max(0, cursor - half)
@@ -1793,6 +1926,7 @@ class BrowserCompleter:
         'links', 'l', 'ls',
         'find', '/',
         'source', 'url',
+        'input',
         'history', 'hist',
         'delh', 'clearhistory', 'clearhist',
         'bookmark', 'bm', 'mark',
@@ -1804,7 +1938,7 @@ class BrowserCompleter:
         'help', '?', 'h',
         'quit', 'q', 'exit', 'bye',
     ]
-    NAV_CMDS = {'go', 'visit', 'navigate', 'g', 'open', 'ob'}
+    NAV_CMDS = {'go', 'visit', 'navigate', 'g', 'open', 'ob', 'input'}
     DELBM_CMDS = {'delbm', 'rmbm'}
     UNSUB_CMDS = {'unsubscribe', 'unsub'}
 
@@ -1858,6 +1992,9 @@ class HandlerResult:
     # Set True by handlers that issued an interactive input prompt, so the
     # fetch loop can apply an independent interaction-cycle ceiling even
     # though such results reset the redirect counter (issue #1).
+    #
+    # NOTE: Spartan never sets this — Spartan has no server-driven input
+    # status code; its input is purely client-side via `=:` content lines.
     is_input_cycle: bool = False
 
 
@@ -1872,6 +2009,9 @@ class Browser:
         self.hist_pos: int = len(self.history) - 1
         self.current_url: Optional[str] = None
         self.current_links: list[tuple[str, str]] = []
+        self.current_prompts: list[PromptLink] = []
+        # Display-order map: numbered[n-1] == ("link"|"prompt", index).
+        self.current_numbered: list[tuple[str, int]] = []
         self.current_render_lines: list[str] = []
         self.last_body: Optional[bytes] = None
         self.last_mime: Optional[str] = None
@@ -1949,6 +2089,20 @@ class Browser:
         """Flush state to disk."""
         self.flush_history()
 
+    def _reset_page_state(self) -> None:
+        """Clear per-page link/prompt/render state."""
+        self.current_links = []
+        self.current_prompts = []
+        self.current_numbered = []
+        self.current_render_lines = []
+
+    def _apply_render_result(self, result: RenderResult) -> None:
+        """Store a RenderResult's link/prompt/numbering state on the browser."""
+        self.current_links = result.links
+        self.current_prompts = result.prompts
+        self.current_numbered = result.numbered
+        self.current_render_lines = result.lines
+
     # ── Protocol Fetch Wrappers ─────────────────────────────────────────────
 
     def _fetch_spartan_wrapper(self, url: str, data: bytes):
@@ -1995,8 +2149,8 @@ class Browser:
 
     # ── Public Navigation ───────────────────────────────────────────────────
 
-    def navigate(self, url: str, push_history: bool = True) -> None:
-        self._fetch(url, push_history=push_history)
+    def navigate(self, url: str, push_history: bool = True, data: bytes = b"") -> None:
+        self._fetch(url, data=data, push_history=push_history)
 
     def go_back(self) -> None:
         if self.hist_pos > 0:
@@ -2067,20 +2221,29 @@ class Browser:
         _find_mode(self.current_render_lines, match_indices, query)
 
     def open_link(self, raw: str) -> None:
+        """Follow a numbered selection — either a navigation link or a
+        Spartan `=:` input prompt — using the shared numbering space."""
         try:
             idx = int(raw) - 1
         except ValueError:
-            print(red(f"  Not a valid link number: {raw!r}"))
+            print(red(f"  Not a valid selection number: {raw!r}"))
             return
 
-        if not (0 <= idx < len(self.current_links)):
+        if not (0 <= idx < len(self.current_numbered)):
+            total = len(self.current_numbered)
             print(red(
-                f"  Link [{raw}] doesn't exist — "
-                f"page has {len(self.current_links)} link(s)."
+                f"  Selection [{raw}] doesn't exist — "
+                f"page has {total} selectable item(s)."
             ))
             return
 
-        label, url = self.current_links[idx]
+        kind, list_idx = self.current_numbered[idx]
+
+        if kind == "prompt":
+            self._follow_prompt(self.current_prompts[list_idx])
+            return
+
+        label, url = self.current_links[list_idx]
 
         if url.startswith("gopher-search://"):
             self._handle_gopher_search(url, label)
@@ -2099,6 +2262,73 @@ class Browser:
         else:
             print(yellow("  External link (unsupported scheme):"))
             print(f"  {dim(url)}")
+
+    def _follow_prompt(self, prompt: PromptLink) -> None:
+        """Gather text for a Spartan `=:` prompt and upload it as the request
+        BODY of a request to the prompt's target URL.
+
+        Per the Spartan model, input is delivered as the request body, not as
+        a query string. We therefore call navigate() with explicit `data`.
+        """
+        if not prompt.url.startswith("spartan://"):
+            # `=:` is a Spartan construct. If a non-Spartan target somehow
+            # appears, refuse to body-upload (the other protocols use query
+            # strings / their own input flows) and just navigate.
+            print(yellow(
+                "  ⚠  Input prompt targets a non-Spartan URL; "
+                "following as an ordinary link."
+            ))
+            if any(prompt.url.startswith(s) for s in SUPPORTED_SCHEMES):
+                self.navigate(prompt.url)
+            else:
+                print(f"  {dim(prompt.url)}")
+            return
+
+        print(yellow(f"\n  ✎  {bold(prompt.label)}"))
+        try:
+            text = input(cyan("  ❯ "))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        # Empty input still uploads an empty body — that is a legitimate
+        # Spartan request (the echo endpoint, for instance, will echo back
+        # nothing). We allow it but confirm first.
+        if text == "":
+            if not self._confirm("  Send empty input? [y/N]: "):
+                print(dim("  Cancelled."))
+                return
+
+        payload = text.replace("\r\n", "\n").encode("utf-8")
+        self.navigate(prompt.url, data=payload)
+
+    def input_upload(self, arg: str, arg2: str = "") -> None:
+        """Directly upload a body to a Spartan URL (a manual `=:` prompt).
+
+        Usage:
+            input <spartan-url>            → prompt for the body interactively
+            input <spartan-url> <text…>    → upload <text…> as the body
+        """
+        url = arg.strip()
+        if not url:
+            print(yellow("  Usage: input <spartan-url> [text]"))
+            return
+        if "://" not in url:
+            url = f"spartan://{url}"
+        if not url.startswith("spartan://"):
+            print(yellow(
+                "  The 'input' command uploads a request body, which is a "
+                "Spartan-only construct.\n"
+                "  For Gemini/Kepler input, just open the URL and answer the "
+                "server's prompt."
+            ))
+            return
+        # Reuse the prompt machinery. If inline text was given, skip the prompt.
+        if arg2:
+            payload = arg2.replace("\r\n", "\n").encode("utf-8")
+            self.navigate(url, data=payload)
+        else:
+            self._follow_prompt(PromptLink(label=f"Input for {url}", url=url))
 
     def _handle_gopher_search(self, search_url: str, label: str) -> None:
         parts = urlparse(search_url)
@@ -2407,38 +2637,47 @@ class Browser:
         # Render as a synthetic page so links are numbered and openable.
         base = next(iter(self.subscriptions), "gemini://localhost/")
         gemtext = "\n".join(out)
-        lines, links = render_gemtext(gemtext, base)
+        result = render_gemtext(gemtext, base)
         self.current_url = None
         self.current_is_feed = False
         self.last_body = gemtext.encode("utf-8")
         self.last_mime = "text/gemini"
-        self.current_links = links
-        self.current_render_lines = lines
+        self._apply_render_result(result)
 
         print()
-        self._emit_lines(lines)
+        self._emit_lines(result.lines)
         print()
         print(hr())
+        n_links = len(result.links)
         print(dim(
-            f"\n  {len(links)} new entr{'y' if len(links) == 1 else 'ies'} — "
+            f"\n  {n_links} new entr{'y' if n_links == 1 else 'ies'} — "
             f"type a number to open, or 'subs' for the feed list.\n"
         ))
 
     # ── Display Helpers ─────────────────────────────────────────────────────
 
     def show_links(self, pattern: str = "") -> None:
-        if not self.current_links:
+        if not self.current_numbered:
             print(yellow("  No links on this page."))
             return
         print()
-        print(bold("  Links on this page:"))
+        print(bold("  Selectable items on this page:"))
         print()
-        for i, (label, url) in enumerate(self.current_links, 1):
+        for n, (kind, list_idx) in enumerate(self.current_numbered, 1):
+            if kind == "prompt":
+                p = self.current_prompts[list_idx]
+                label, url = p.label, p.url
+                tag = bright_magenta(f"[{n}]")
+                kind_note = dim(" (input)")
+            else:
+                label, url = self.current_links[list_idx]
+                tag = bright_cyan(f"[{n}]")
+                kind_note = ""
             if pattern:
                 pat_lower = pattern.lower()
                 if not (pat_lower in label.lower() or pat_lower in url.lower()):
                     continue
-            print(f"  {bright_cyan(f'[{i}]')} {label}")
+            print(f"  {tag} {label}{kind_note}")
             print(f"       {dim(url)}")
         print()
 
@@ -2572,7 +2811,7 @@ class Browser:
 
         print(bold("  Navigation"))
         row("go <url>",            "Navigate to any supported URL")
-        row("<number>",            "Follow a link by its number")
+        row("<number>",            "Follow a link or answer an input prompt")
         row("back  /  b",          "Go back in history")
         row("forward  /  f",       "Go forward in history")
         row("up  /  ..",           "Go up one directory level")
@@ -2581,11 +2820,18 @@ class Browser:
         row("finger <user@host>",  "Finger a user")
         print()
         print(bold("  Page"))
-        row("links  /  l",         "List all links")
+        row("links  /  l",         "List links and input prompts")
         row("find <term>  /  /",   "Search page")
         row("source",              "View raw source")
         row("save [file]",         "Save current page")
         row("url",                 "Show current URL")
+        print()
+        print(bold("  Spartan input"))
+        row("input <url> [text]",  "Upload a body to a Spartan URL")
+        print(dim("  A `=:` line in Spartan content is also an input prompt, shown"))
+        print(dim("  as a magenta [n] ✎ item; selecting it asks for text which is"))
+        print(dim("  uploaded as the request BODY. Spartan has no input STATUS"))
+        print(dim("  code — input is purely client-side."))
         print()
         print(bold("  Feeds (RSS / Atom)"))
         row("subscribe [url]",     "Subscribe to a feed (or current page)")
@@ -2721,28 +2967,34 @@ class Browser:
     # ── Response Handlers (one per scheme) ──────────────────────────────────
 
     def _handle_spartan(self, code, meta, body, extras, current_url, push_history):
+        """Handle a Spartan response.
+
+        Spartan has exactly four status codes and NO input-required code:
+            2  success
+            3  redirect
+            4  client error
+            5  server error
+        Interactive input is NOT server-driven — it is delivered client-side
+        as a request body via `=:` content lines (see _follow_prompt).
+        """
         if code == 2:
             mime = meta.split(";")[0].strip().lower() if meta else "text/gemini"
             self._handle_success(current_url, body, mime, push_history)
             return HandlerResult(done=True)
         if code == 3:
-            return HandlerResult(done=False, redirect_to=resolve_url(current_url, meta.strip()))
+            target = meta.strip()
+            if not target:
+                print(bright_red("\n  ✗  Empty redirect target\n"))
+                return HandlerResult(done=True)
+            redirect_url = resolve_url(current_url, target)
+            print(yellow(f"  ⟶  Redirect → {redirect_url}"))
+            return HandlerResult(done=False, redirect_to=redirect_url)
         if code == 4:
             print(bright_red(f"\n  ✗  Client error ({code}): {meta}\n"))
             return HandlerResult(done=True)
         if code == 5:
-            user_input = self._prompt_input(meta or "Input")
-            if user_input is None or user_input == "":
-                return HandlerResult(done=True)
-            payload = user_input.encode("utf-8")
-            return HandlerResult(
-                done=False,
-                redirect_to=current_url,
-                new_url=current_url,
-                reset_redirects=True,
-                data=payload,
-                is_input_cycle=True,
-            )
+            print(bright_red(f"\n  ✗  Server error ({code}): {meta}\n"))
+            return HandlerResult(done=True)
         print(bright_red(f"\n  ✗  Unknown Spartan code {code}: {meta}\n"))
         return HandlerResult(done=True)
 
@@ -2866,7 +3118,13 @@ class Browser:
     # ── Main Fetch Loop ─────────────────────────────────────────────────────
 
     def _fetch(self, url: str, data: bytes = b"", push_history: bool = True) -> None:
-        """Iteratively fetch+render a URL, handling redirects and input."""
+        """Iteratively fetch+render a URL, handling redirects and input.
+
+        `data` is an optional request body. For Spartan it is the upload
+        body (e.g. text gathered from a `=:` prompt or the `input` command);
+        for other protocols it is generally unused (input is delivered via
+        query strings).
+        """
         current_url = url
         current_data = data
         redirect_depth = 0
@@ -2884,10 +3142,11 @@ class Browser:
                 print(bright_red(f"  ✗  Too many redirects (>{max_redirects}), aborting.\n"))
                 return
 
-            # Independent ceiling on interactive input cycles. Input responses
-            # reset the redirect counter (so a legitimate form can submit and
-            # then be redirected freely), so without this a hostile server
-            # could trap the user in an endless prompt loop (issue #1).
+            # Independent ceiling on interactive (Kepler/Gemini) input cycles.
+            # Input responses reset the redirect counter (so a legitimate form
+            # can submit and then be redirected freely), so without this a
+            # hostile server could trap the user in an endless prompt loop
+            # (issue #1). Spartan never triggers this path.
             if input_cycles > _MAX_INPUT_CYCLES:
                 print(bright_red(
                     f"  ✗  Too many input cycles (>{_MAX_INPUT_CYCLES}), aborting.\n"
@@ -2975,7 +3234,7 @@ class Browser:
 
         if scheme == "finger":
             lines = render_finger(body, url)
-            self.current_links = []
+            self._reset_page_state()
             self.current_render_lines = lines
             self._emit_lines(lines)
             print()
@@ -3004,25 +3263,44 @@ class Browser:
             text = None
 
         if text is not None and ("text/gemini" in mime or mime == ""):
-            lines, links = render_gemtext(text, url)
-            self.current_links = links
+            result = render_gemtext(text, url)
+            self._apply_render_result(result)
         elif text is not None and "text/" in mime:
-            lines, links = render_plain(text), []
-            self.current_links = []
+            self._reset_page_state()
+            self.current_render_lines = render_plain(text)
+        elif text is not None and _looks_like_text(body):
+            # Body is labelled binary (e.g. application/octet-stream from an
+            # echo endpoint) but is actually printable text — render it as
+            # plain text rather than offering a file download.
+            print(dim(f"  (rendering {mime or 'binary'} as text — it looks textual)"))
+            self._reset_page_state()
+            self.current_render_lines = render_plain(text)
         else:
             self._handle_binary(body, url, mime)
             return
 
-        self.current_render_lines = lines
-        self._emit_lines(lines)
+        self._emit_lines(self.current_render_lines)
         print()
         print(hr())
-        if self.current_links:
-            print(dim(
-                f"\n  {len(self.current_links)} link(s) on page — "
-                f"type a number to follow, or 'links' for the full list."
-            ))
+        self._print_selection_hint()
         print()
+
+    def _print_selection_hint(self) -> None:
+        """Print a footer hint describing how many links / prompts exist."""
+        n_links = len(self.current_links)
+        n_prompts = len(self.current_prompts)
+        if n_links == 0 and n_prompts == 0:
+            return
+        bits = []
+        if n_links:
+            bits.append(f"{n_links} link(s)")
+        if n_prompts:
+            bits.append(bright_magenta(f"{n_prompts} input prompt(s)"))
+        joined = " + ".join(bits)
+        print(dim(
+            f"\n  {joined} on page — "
+            f"type a number to follow/answer, or 'links' for the full list."
+        ))
 
     def _render_feed(self, body: bytes, url: str) -> bool:
         """Render a feed as gemtext. Returns True on success, False to let
@@ -3036,12 +3314,11 @@ class Browser:
             return False
 
         gemtext = feed_to_gemtext(feed, url, summaries=not self.feed_compact)
-        lines, links = render_gemtext(gemtext, url)
-        self.current_links = links
-        self.current_render_lines = lines
+        result = render_gemtext(gemtext, url)
+        self._apply_render_result(result)
         self.current_is_feed = True
 
-        self._emit_lines(lines)
+        self._emit_lines(result.lines)
         print()
         print(hr())
 
@@ -3062,12 +3339,14 @@ class Browser:
         if is_gopher_menu(body):
             try:
                 gemtext = gopher_menu_to_gemtext(body, url)
-                lines, links = render_gemtext(gemtext, url)
-                self.current_links = links
+                result = render_gemtext(gemtext, url)
+                self._apply_render_result(result)
             except (ValueError, UnicodeDecodeError) as e:
                 print(bright_red(f"  ✗  Error parsing Gopher menu: {e}"))
-                lines = render_plain(body.decode("utf-8", errors="replace"))
-                self.current_links = []
+                self._reset_page_state()
+                self.current_render_lines = render_plain(
+                    body.decode("utf-8", errors="replace")
+                )
         else:
             # A Gopher text file could still be a feed (type 0 .xml selector),
             # but Gopher hands us no MIME, so we require a *strong* feed signal
@@ -3079,21 +3358,16 @@ class Browser:
                     return
             try:
                 text = body.decode("utf-8", errors="replace")
-                lines = render_plain(text)
-                self.current_links = []
+                self._reset_page_state()
+                self.current_render_lines = render_plain(text)
             except UnicodeDecodeError:
                 self._handle_binary(body, url, "application/octet-stream")
                 return
 
-        self.current_render_lines = lines
-        self._emit_lines(lines)
+        self._emit_lines(self.current_render_lines)
         print()
         print(hr())
-        if self.current_links:
-            print(dim(
-                f"\n  {len(self.current_links)} link(s) on page — "
-                f"type a number to follow, or 'links' for the full list."
-            ))
+        self._print_selection_hint()
         print()
 
     def _emit_lines(self, lines: list[str]) -> None:
@@ -3104,8 +3378,7 @@ class Browser:
                 print(line)
 
     def _handle_binary(self, body: bytes, url: str, mime: str) -> None:
-        self.current_render_lines = []
-        self.current_links = []
+        self._reset_page_state()
         print(yellow(f"  Binary content ({mime or 'unknown'}), {len(body):,} bytes"))
         fname = _safe_filename_from_url(url, default="download")
         if self._confirm(f"  Save as [{fname}]? [y/N]: "):
@@ -3134,8 +3407,12 @@ class Browser:
                 )
             hist = dim(f"[{self.hist_pos + 1}/{len(self.history)}]")
             scheme_display = green(scheme) if scheme == "keplers" else cyan(scheme)
-            feed_marker = bright_green(" ⊚") if self.current_is_feed else ""
-            return f"{scheme_display}:{bright_cyan(display)}{feed_marker} {hist} {bright_cyan('❯')} "
+            markers = ""
+            if self.current_is_feed:
+                markers += bright_green(" ⊚")
+            if self.current_prompts:
+                markers += bright_magenta(" ✎")
+            return f"{scheme_display}:{bright_cyan(display)}{markers} {hist} {bright_cyan('❯')} "
         return f"{bright_cyan('browser')} {bright_cyan('❯')} "
 
 
@@ -3256,6 +3533,9 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
         else:
             browser.unsubscribe(arg)
 
+    def cmd_input(arg, arg2):
+        browser.input_upload(arg, arg2)
+
     table: dict[str, Callable[[str, str], None]] = {}
 
     def register(names, fn):
@@ -3275,6 +3555,7 @@ def _make_command_table(browser: Browser) -> dict[str, Callable[[str, str], None
     register(("source",), lambda a, b: browser.show_source())
     register(("url",), lambda a, b: browser.show_url())
     register(("save",), lambda a, b: browser.save_page(a))
+    register(("input", "=:"), cmd_input)
     register(("history", "hist"), lambda a, b: browser.show_history())
     register(("delh",), cmd_delh)
     register(("clearhistory", "clearhist"), lambda a, b: browser.history_clear())
@@ -3344,6 +3625,25 @@ def run_repl(start_url: Optional[str] = None) -> None:
         if handler:
             handler(arg, arg2)
         else:
+            # Friendly hint when the user pastes raw gemtext syntax (=> or =:)
+            # at the command prompt instead of a command. Without this they
+            # got a cryptic "Unsupported scheme: ''" from normalise_url.
+            stripped = raw.lstrip()
+            if stripped.startswith("=>") or stripped.startswith("=:"):
+                print(yellow(
+                    "  That looks like gemtext page syntax, not a command."
+                ))
+                if stripped.startswith("=:"):
+                    print(dim(
+                        "  To upload input to a Spartan URL, use:  "
+                        "input <spartan-url> [text]"
+                    ))
+                else:
+                    print(dim(
+                        "  To open a link, use:  go <url>   "
+                        "(or type its number on a rendered page)."
+                    ))
+                continue
             try:
                 browser.navigate(_norm(raw))
             except ValueError as e:
