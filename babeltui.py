@@ -1639,13 +1639,10 @@ def getch() -> str:
         ch = msvcrt.getwch()
         if ch in ('\x00', '\xe0'):
             ch2 = msvcrt.getwch()
-            return {
-                'H': '\x1b[A', 'P': '\x1b[B',
-                'M': '\x1b[C', 'K': '\x1b[D',
-            }.get(ch2, '')
+            return {'H': '\x1b[A', 'P': '\x1b[B',
+                    'M': '\x1b[C', 'K': '\x1b[D'}.get(ch2, '')
         return ch
 
-    import select
     import termios
     import tty
     fd = sys.stdin.fileno()
@@ -1654,27 +1651,22 @@ def getch() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == '\x1b':
-            # Distinguish a bare ESC (no following byte within the window)
-            # from a CSI/SS3 escape sequence. If nothing is immediately
-            # available, treat it as a standalone ESC so a lone ESC keypress
-            # is never merged with subsequently-typed input (issue #9).
-            if not select.select([sys.stdin], [], [], 0.05)[0]:
-                return '\x1b'
-            ch2 = sys.stdin.read(1)
-            if ch2 == '[':
+            ch2 = sys.stdin.read(1)          # blocking — no select gate
+            if ch2 in ('[', 'O'):
                 seq = ''
-                while select.select([sys.stdin], [], [], 0.05)[0]:
-                    ch3 = sys.stdin.read(1)
-                    if not ch3 or ch3.isalpha() or ch3 in '~':
-                        return '\x1b[' + seq + ch3
+                while True:
+                    ch3 = sys.stdin.read(1)  # blocking
+                    if not ch3:
+                        break
                     seq += ch3
-                return '\x1b[' + seq
+                    if ch3.isalpha() or ch3 == '~':
+                        break
+                return '\x1b[' + seq         # normalize SS3 -> CSI
             return '\x1b' + ch2
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
+        
 def _find_mode(render_lines: list[str], match_indices: list[int], query: str) -> None:
     """Interactive find mode."""
     if not match_indices:
