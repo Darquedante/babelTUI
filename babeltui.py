@@ -1633,7 +1633,7 @@ def highlight_query(line: str, query: str, current: bool) -> str:
 
 
 def getch() -> str:
-    """Read exactly one keypress without requiring Enter."""
+    """Read one keypress. Falls back to line input where no raw TTY exists."""
     if os.name == 'nt':
         import msvcrt
         ch = msvcrt.getwch()
@@ -1646,27 +1646,34 @@ def getch() -> str:
     import termios
     import tty
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    try:
+        old = termios.tcgetattr(fd)      # raises if stdin is not a TTY
+    except termios.error:
+        # No raw terminal (pipe/redirect/odd console). Degrade to line input
+        # so the program runs everywhere rather than crashing.
+        line = sys.stdin.readline()
+        return line[:1] if line else 'q'
+
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == '\x1b':
-            ch2 = sys.stdin.read(1)          # blocking — no select gate
+            ch2 = sys.stdin.read(1)
             if ch2 in ('[', 'O'):
                 seq = ''
                 while True:
-                    ch3 = sys.stdin.read(1)  # blocking
+                    ch3 = sys.stdin.read(1)
                     if not ch3:
                         break
                     seq += ch3
                     if ch3.isalpha() or ch3 == '~':
                         break
-                return '\x1b[' + seq         # normalize SS3 -> CSI
+                return '\x1b[' + seq
             return '\x1b' + ch2
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        
+              
 def _find_mode(render_lines: list[str], match_indices: list[int], query: str) -> None:
     """Interactive find mode."""
     if not match_indices:
